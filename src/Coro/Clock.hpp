@@ -2,6 +2,7 @@
 #pragma once
 
 #include <chrono>
+#include <thread>
 
 namespace Coro
 {
@@ -27,6 +28,18 @@ class IClock
 
     /// @return The current time, in the clock's own time domain.
     [[nodiscard]] virtual TimePoint Now() const noexcept = 0;
+
+    /// Wait until `Now() >= deadline`, in the clock's own time domain.
+    ///
+    /// This keeps *waiting* behind the same DI seam as *reading* time: the
+    /// event loop never calls `std::this_thread::sleep_until` directly,
+    /// because that would interpret an injected fake clock's time points
+    /// as wall time. `SystemClock` really blocks the thread; a test clock
+    /// simply jumps forward (see `tests::ManualClock`), which makes
+    /// `EventLoop::Run` deterministic and instant under test.
+    /// @param deadline Time point that `Now()` must have reached when this
+    ///                 call returns.
+    virtual void WaitUntil(TimePoint deadline) = 0;
 };
 
 /// Real-time clock backed by `std::chrono::steady_clock`. Default
@@ -37,6 +50,13 @@ class SystemClock final: public IClock
     [[nodiscard]] TimePoint Now() const noexcept override
     {
         return std::chrono::steady_clock::now();
+    }
+
+    /// Blocks the calling thread until @p deadline (wall-clock sleep).
+    /// @param deadline Steady-clock time point to sleep until.
+    void WaitUntil(TimePoint deadline) override
+    {
+        std::this_thread::sleep_until(deadline);
     }
 };
 

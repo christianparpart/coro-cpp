@@ -3,6 +3,8 @@
 
 #include <Coro/Clock.hpp>
 
+#include <algorithm>
+
 namespace tests
 {
 
@@ -25,6 +27,15 @@ class ManualClock final: public Coro::IClock
     void Advance(Duration delta) noexcept
     {
         _now += delta;
+    }
+
+    /// "Waits" by jumping straight to @p deadline (never backwards).
+    /// This is what lets `EventLoop::Run` complete timer waits
+    /// deterministically and instantly under a manual clock.
+    /// @param deadline Time point to advance the clock to.
+    void WaitUntil(TimePoint deadline) noexcept override
+    {
+        _now = std::max(_now, deadline);
     }
 
   private:

@@ -8,7 +8,6 @@
 #include <coroutine>
 #include <cstddef>
 #include <deque>
-#include <memory>
 #include <vector>
 
 namespace Coro
@@ -21,13 +20,15 @@ namespace Coro
 ///   * a FIFO ready-queue of coroutine handles to resume next;
 ///   * a min-heap of (deadline, handle) timer entries.
 ///
-/// Each iteration: drain the ready-queue, then either sleep until the
-/// next timer (in production) or fail-fast (in tests with a manual
-/// clock). When a timer fires its handle is moved from the heap into
-/// the ready queue, then resumed in the next drain.
+/// Each iteration: drain the ready-queue, then wait until the next
+/// timer is due. When a timer fires its handle is moved from the heap
+/// into the ready queue, then resumed in the next drain.
 ///
-/// The clock is injected through the `IClock` interface — production code passes `SystemClock`, 
-/// tests pass a `ManualClock` that exposes `Advance(d)`.
+/// The clock is injected through the `IClock` interface — both for
+/// reading time and for waiting (`IClock::WaitUntil`). Production code
+/// passes `SystemClock` (which really sleeps); tests pass a
+/// `ManualClock` that exposes `Advance(d)` and "waits" by jumping
+/// forward, so `Run` is deterministic and instant under test.
 class EventLoop final: public IScheduler
 {
   public:
@@ -50,19 +51,25 @@ class EventLoop final: public IScheduler
         return _clock;
     }
 
-    /// Drive the loop to completion of the given root task.
-    /// Posts the root coroutine to the ready queue and then iterates
-    /// until either the loop runs dry (nothing ready, nothing
-    /// scheduled) or the root task is done.
+    /// Drive the loop until it is fully drained: the root task has
+    /// completed, every detached task posted onto the loop has run to
+    /// completion, and no ready handles or timers remain. Draining is
+    /// what guarantees that no coroutine handle from this run survives
+    /// into a later `Run`/`RunOnce` call, and that detached frames get
+    /// to reclaim themselves. Detached tasks that should not outlive
+    /// the root must be made stop-aware (see the demos' use of
+    /// `std::stop_source`).
     ///
-    /// The blocking strategy between timer fires is data-driven by the
-    /// injected clock: with `SystemClock`, the loop sleeps until the
-    /// next timer using `std::this_thread::sleep_until`. Tests that
-    /// inject a `ManualClock` are expected to advance the clock
-    /// themselves between `Run` calls.
+    /// Waiting between timer fires goes through the injected clock seam
+    /// (`IClock::WaitUntil`): `SystemClock` sleeps the thread, a
+    /// `ManualClock` jumps straight to the next deadline, so tests may
+    /// simply call `Run` and get deterministic, instant timer waits.
     ///
     /// @param root Root coroutine driving the demo. Must not be empty.
     ///             Taken by value; ownership is moved into the loop.
+    /// @throws Re-throws an exception that escaped the root task's body
+    ///         once the loop has drained, after the root frame has been
+    ///         reclaimed — a failing root is never silently swallowed.
     void Run(Task<void> root);
 
     /// Single-step the loop: drain ready handles once and fire any
@@ -74,9 +81,9 @@ class EventLoop final: public IScheduler
   private:
     struct TimerEntry
     {
-        IClock::TimePoint when;
-        std::coroutine_handle<> handle;
-        std::size_t sequence; ///< FIFO tiebreak for same-deadline entries.
+        IClock::TimePoint when {};
+        std::coroutine_handle<> handle {};
+        std::size_t sequence { 0 }; ///< FIFO tiebreak for same-deadline entries.
     };
 
     /// Strict-weak ordering for the timer min-heap (latest first, so

@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "ManualClock.hpp"
+
 #include <Coro/EventLoop.hpp>
 #include <Coro/Sleep.hpp>
 #include <Coro/Task.hpp>
 
-#include "ManualClock.hpp"
-
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <stdexcept>
+#include <vector>
 
 using namespace std::chrono_literals;
 
@@ -83,4 +85,66 @@ TEST_CASE("EventLoop preserves FIFO order for ready handles", "[EventLoop]")
     loop.RunOnce();
 
     REQUIRE(order == std::vector<int> { 1, 2, 3 });
+}
+
+TEST_CASE("EventLoop::Run rethrows an exception escaping the root task", "[EventLoop]")
+{
+    auto clock = tests::ManualClock {};
+    auto loop = Coro::EventLoop { clock };
+
+    auto root = []() -> Coro::Task<void> {
+        throw std::runtime_error { "boom" };
+        co_return; // unreachable; marks the function as a coroutine
+    };
+
+    REQUIRE_THROWS_AS(loop.Run(root()), std::runtime_error);
+}
+
+TEST_CASE("EventLoop::Run completes timer waits deterministically under a manual clock", "[EventLoop]")
+{
+    auto clock = tests::ManualClock {};
+    auto loop = Coro::EventLoop { clock };
+    auto reached = false;
+
+    auto root = [&]() -> Coro::Task<void> {
+        co_await Coro::Sleep(loop, 100ms);
+        reached = true;
+    };
+
+    // Run waits through the injected clock seam, so the manual clock
+    // jumps straight to the deadline instead of busy-spinning forever.
+    loop.Run(root());
+
+    REQUIRE(reached);
+    REQUIRE(clock.Now() == Coro::IClock::TimePoint {} + 100ms);
+}
+
+TEST_CASE("EventLoop::Run drains detached work and leaves the loop reusable", "[EventLoop]")
+{
+    auto clock = tests::ManualClock {};
+    auto loop = Coro::EventLoop { clock };
+    auto detachedFinished = false;
+    auto secondRootRan = false;
+
+    auto sleeper = [&]() -> Coro::Task<void> {
+        co_await Coro::Sleep(loop, 200ms);
+        detachedFinished = true;
+    };
+    auto root = [&]() -> Coro::Task<void> {
+        loop.Post(sleeper());
+        co_await Coro::Sleep(loop, 10ms);
+    };
+
+    // The detached sleeper outlives the root; Run keeps pumping until it
+    // completed, so no handle from this run survives into the next one.
+    loop.Run(root());
+    REQUIRE(detachedFinished);
+
+    auto secondRoot = [&]() -> Coro::Task<void> {
+        secondRootRan = true;
+        co_return;
+    };
+
+    loop.Run(secondRoot());
+    REQUIRE(secondRootRan);
 }

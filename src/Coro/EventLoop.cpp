@@ -3,7 +3,9 @@
 
 #include <algorithm>
 #include <cassert>
-#include <thread>
+#include <cstddef>
+#include <exception>
+#include <ranges>
 #include <utility>
 
 namespace Coro
@@ -40,53 +42,57 @@ void EventLoop::DrainExpiredTimers()
 bool EventLoop::RunOnce()
 {
     DrainExpiredTimers();
-    bool resumedAny = false;
     // Snapshot the ready queue size so handles posted by resumed
     // coroutines run on the next iteration, not this one — this keeps
     // a single `RunOnce` call bounded.
     auto const drainCount = _ready.size();
-    for (std::size_t i = 0; i < drainCount; ++i)
+    for ([[maybe_unused]] auto const i: std::views::iota(std::size_t { 0 }, drainCount))
     {
-        auto handle = _ready.front();
+        auto const handle = _ready.front();
         _ready.pop_front();
-        resumedAny = true;
         handle.resume();
     }
-    return resumedAny;
+    return drainCount > 0;
 }
 
 void EventLoop::Run(Task<void> root)
 {
-    auto handle = root.Release();
+    auto const handle = std::move(root).Release();
     assert(handle && "Coro::EventLoop::Run requires a non-empty root task");
     Post(handle);
 
+    // Pump until the loop is fully drained: nothing ready, no pending
+    // timers. Draining — rather than stopping the moment the root is done
+    // — is what lets detached tasks run to completion and reclaim their
+    // frames, and it guarantees no handle from this run is left behind to
+    // dangle into a later Run/RunOnce call.
     while (true)
     {
         DrainExpiredTimers();
 
-        if (_ready.empty())
+        if (!_ready.empty())
         {
-            if (_timers.empty())
-                break; // nothing ready, no future timers — loop drains.
-            // Block until the next timer is due. With SystemClock this
-            // is wall-clock sleep; with a ManualClock the test is
-            // expected to never reach this branch (it advances the
-            // clock so a timer is already due before re-entering).
-            std::this_thread::sleep_until(_timers.front().when);
+            auto const next = _ready.front();
+            _ready.pop_front();
+            next.resume();
             continue;
         }
 
-        auto next = _ready.front();
-        _ready.pop_front();
-        next.resume();
+        if (_timers.empty())
+            break; // nothing ready, no future timers — loop has drained.
 
-        if (handle.done())
-            break;
+        // Wait for the next timer through the injected clock seam:
+        // SystemClock sleeps the thread, a manual test clock jumps
+        // straight to the deadline (keeping tests deterministic).
+        _clock.WaitUntil(_timers.front().when);
     }
 
-    if (handle)
-        handle.destroy();
+    // Reclaim the root frame first so it (and everything it owns) is
+    // released even when the root failed; then surface the failure.
+    auto exception = std::move(handle.promise().exception);
+    handle.destroy();
+    if (exception)
+        std::rethrow_exception(exception);
 }
 
 } // namespace Coro
