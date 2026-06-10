@@ -146,12 +146,11 @@ Coro::Task<void> Run(Coro::IScheduler& scheduler, demos::IKeyPress& keys)
         Coro::Spawn(scheduler, Animate(scheduler, region, source.get_token()));
 
     // Block the root on the key poller. When it returns, the stop has
-    // been requested; one more tick lets every region print its final
-    // "stopped" frame before we move the cursor below the dashboard.
+    // been requested; the event loop then drains the detached region
+    // coroutines, so each one wakes on its next tick, observes the stop,
+    // and prints its final "stopped" frame before `EventLoop::Run`
+    // returns — no matter how its interval relates to the poll cadence.
     co_await WaitForKey(scheduler, keys, source);
-    co_await Coro::Sleep(scheduler, PollInterval);
-
-    std::cout << CursorTo(static_cast<int>(Regions.size()) + 4) << '\n' << std::flush;
 }
 
 } // namespace
@@ -163,5 +162,9 @@ int main()
     auto keys = demos::TerminalKeyPress {};
     auto const cursor = CursorHider {};
     loop.Run(Run(loop, keys));
+    // Run has drained every region coroutine (each printed its final
+    // "stopped" frame), so the dashboard is complete — park the cursor
+    // below it before handing the terminal back.
+    std::cout << CursorTo(static_cast<int>(Regions.size()) + 4) << '\n' << std::flush;
     return 0;
 }

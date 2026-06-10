@@ -14,7 +14,6 @@
 #include <array>
 #include <chrono>
 #include <iostream>
-#include <ranges>
 #include <stop_token>
 #include <string_view>
 
@@ -51,9 +50,10 @@ Coro::Task<void> Run(Coro::IScheduler& scheduler)
 {
     auto source = std::stop_source {};
     Coro::Spawn(scheduler, Spinner(scheduler, source.get_token()));
+    // After the work requests the stop, the event loop drains the
+    // detached spinner: it wakes on its next frame tick, observes the
+    // stop, and prints "done." before `EventLoop::Run` returns.
     co_await Work(scheduler, source);
-    // Yield once so the spinner observes the stop and prints "done.".
-    co_await Coro::Sleep(scheduler, FrameInterval);
 }
 
 } // namespace
