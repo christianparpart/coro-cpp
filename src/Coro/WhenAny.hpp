@@ -10,6 +10,8 @@
 #include <exception>
 #include <memory>
 #include <optional>
+#include <ranges>
+#include <stdexcept>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -108,31 +110,48 @@ struct WhenAnyResult
 /// scaffold. (A production WhenAny would propagate a cancellation
 /// token; here we keep the seam minimal so the talk can focus on the
 /// `co_await` ergonomics rather than cancellation propagation.)
+///
+/// Each child runs inside a *detached* wrapper coroutine
+/// (`IScheduler::Post(Task<void>&&)`): the wrapper owns the child task
+/// and a `shared_ptr` to the shared state, so losers stay alive while
+/// their timers are still registered with the scheduler and reclaim
+/// their frames at `final_suspend` once they finish. Loser completions
+/// after the winner are dropped by `WhenAnyState::OnChildDone`.
 template <typename T>
 class WhenAnyAwaitable
 {
   public:
+    /// @param scheduler Scheduler driving the children concurrently.
+    /// @param tasks Child tasks; ownership is moved.
+    /// @throws std::invalid_argument When @p tasks is empty — a WhenAny
+    ///         over nothing has no winner to produce.
     WhenAnyAwaitable(IScheduler& scheduler, std::vector<Task<T>>&& tasks):
         _state { std::make_shared<Detail::WhenAnyState<T>>() },
         _tasks { std::move(tasks) }
     {
+        if (_tasks.empty())
+            throw std::invalid_argument { "Coro::WhenAny requires at least one task" };
         _state->scheduler = &scheduler;
     }
 
+    /// @return Always `false`: the constructor guarantees at least one
+    ///         child, and no child can have completed before
+    ///         `await_suspend` posts it.
     [[nodiscard]] bool await_ready() const noexcept
     {
-        return _tasks.empty();
+        return false;
     }
 
     void await_suspend(std::coroutine_handle<> continuation)
     {
         _state->parent = continuation;
-        _wrappers.reserve(_tasks.size());
-        for (std::size_t i = 0; i < _tasks.size(); ++i)
-        {
-            _wrappers.push_back(Detail::WhenAnyChild<T>(std::move(_tasks[i]), _state, i));
-            _state->scheduler->Post(_wrappers.back().Native());
-        }
+        // Detach one wrapper per child onto the scheduler. The wrapper owns
+        // the child task and shares the state, so winners and losers alike
+        // live exactly as long as they run and reclaim themselves at
+        // final_suspend — no frame is torn down while its handle is still
+        // registered with the scheduler.
+        for (auto const index: std::views::iota(std::size_t { 0 }, _tasks.size()))
+            _state->scheduler->Post(Detail::WhenAnyChild<T>(std::move(_tasks[index]), _state, index));
     }
 
     WhenAnyResult<T> await_resume()
@@ -156,14 +175,14 @@ class WhenAnyAwaitable
   private:
     std::shared_ptr<Detail::WhenAnyState<T>> _state;
     std::vector<Task<T>> _tasks;
-    std::vector<Task<void>> _wrappers;
 };
 
 /// Construct a WhenAny awaitable from a homogeneous vector of tasks.
 /// @param scheduler Scheduler driving the children concurrently.
-/// @param tasks Child tasks; ownership is moved.
+/// @param tasks Child tasks; ownership is moved. Must not be empty.
 /// @return Awaitable; on `co_await`, resumes with the winner's index
 ///         and value.
+/// @throws std::invalid_argument When @p tasks is empty.
 template <typename T>
 [[nodiscard]] inline auto WhenAny(IScheduler& scheduler, std::vector<Task<T>>&& tasks)
 {
