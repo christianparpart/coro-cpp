@@ -6,6 +6,7 @@
 target_sources(Coro
     PRIVATE
         EventLoop.cpp
+        ManualScheduler.cpp
 )
 
 target_sources(Coro
@@ -18,6 +19,7 @@ target_sources(Coro
             Scheduler.hpp
             Clock.hpp
             EventLoop.hpp
+            ManualScheduler.hpp
             Sleep.hpp
             TimerQueue.hpp
             WhenAll.hpp

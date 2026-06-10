@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <Coro/EventLoop.hpp>
+#include <Coro/ManualScheduler.hpp>
 #include <Coro/Sleep.hpp>
 #include <Coro/Task.hpp>
-
-#include "ManualClock.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -13,48 +11,42 @@ using namespace std::chrono_literals;
 
 TEST_CASE("Sleep with zero duration completes immediately", "[Sleep]")
 {
-    auto clock = tests::ManualClock {};
-    auto loop = Coro::EventLoop { clock };
+    auto scheduler = Coro::ManualScheduler {};
     auto reached = false;
 
-    auto root = [&]() -> Coro::Task<void> {
-        co_await Coro::Sleep(loop, 0ms);
+    auto const root = [&]() -> Coro::Task<void> {
+        co_await Coro::Sleep(scheduler, 0ms);
         reached = true;
-    };
+    }();
 
-    loop.Run(root());
+    scheduler.Post(root.Native());
+    scheduler.RunUntilIdle();
+
     REQUIRE(reached);
+    REQUIRE(root.IsReady());
+    REQUIRE(scheduler.PendingTimerCount() == 0); // ready awaits never arm a timer
 }
 
 TEST_CASE("Two sequential Sleeps add their deadlines", "[Sleep]")
 {
-    auto clock = tests::ManualClock {};
-    auto loop = Coro::EventLoop { clock };
+    auto scheduler = Coro::ManualScheduler {};
     auto reached = 0;
 
-    auto root = [&]() -> Coro::Task<void> {
-        co_await Coro::Sleep(loop, 30ms);
+    auto const root = [&]() -> Coro::Task<void> {
+        co_await Coro::Sleep(scheduler, 30ms);
         ++reached;
-        co_await Coro::Sleep(loop, 30ms);
+        co_await Coro::Sleep(scheduler, 30ms);
         ++reached;
-    };
+    }();
 
-    auto task = root();
-    auto handle = task.Native();
-    loop.Post(handle);
-    static_cast<void>(task.Release());
-
-    loop.RunOnce(); // suspends at first Sleep
+    scheduler.Post(root.Native());
+    scheduler.RunUntilIdle(); // suspends at the first Sleep
     REQUIRE(reached == 0);
 
-    clock.Advance(30ms);
-    loop.RunOnce(); // first Sleep fires, suspends at second Sleep
+    scheduler.AdvanceBy(30ms); // first Sleep fires, suspends at the second
     REQUIRE(reached == 1);
 
-    clock.Advance(30ms);
-    loop.RunOnce();
+    scheduler.AdvanceBy(30ms);
     REQUIRE(reached == 2);
-
-    if (handle)
-        handle.destroy();
+    REQUIRE(root.IsReady());
 }
