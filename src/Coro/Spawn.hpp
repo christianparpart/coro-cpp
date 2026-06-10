@@ -11,9 +11,10 @@ namespace Coro
 
 /// Post the given task to a scheduler and detach: the scheduler will
 /// drive it to completion alongside other tasks. The task's coroutine
-/// frame is owned by the scheduler from this call onwards (the coroutine
-/// self-destroys at `final_suspend` because the continuation is
-/// `noop_coroutine`).
+/// frame owns itself from this call onwards — its promise is marked
+/// detached, so the frame self-destroys at `final_suspend`. An exception
+/// escaping a detached task calls `std::terminate` (there is no awaiter
+/// it could surface at).
 ///
 /// This is the seam the demos use to start a "background" coroutine
 /// (e.g. the spinner in `demo_spinner_cancel`) while another task does

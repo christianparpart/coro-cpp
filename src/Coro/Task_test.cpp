@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "ManualClock.hpp"
+
+#include <Coro/EventLoop.hpp>
 #include <Coro/Task.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -81,4 +84,40 @@ TEST_CASE("Default-constructed Task is empty and safe to destroy", "[Task]")
 {
     auto task = Coro::Task<int> {};
     REQUIRE(task.IsReady());
+}
+
+TEST_CASE("Awaiting an empty Task<void> completes immediately", "[Task]")
+{
+    auto clock = tests::ManualClock {};
+    auto loop = Coro::EventLoop { clock };
+    auto reached = false;
+
+    auto root = [&]() -> Coro::Task<void> {
+        co_await Coro::Task<void> {};
+        reached = true;
+    };
+
+    loop.Run(root());
+    REQUIRE(reached);
+}
+
+TEST_CASE("Awaiting an empty Task<T> throws std::logic_error", "[Task]")
+{
+    auto clock = tests::ManualClock {};
+    auto loop = Coro::EventLoop { clock };
+    auto caughtLogicError = false;
+
+    auto root = [&]() -> Coro::Task<void> {
+        try
+        {
+            [[maybe_unused]] auto const value = co_await Coro::Task<int> {};
+        }
+        catch (std::logic_error const&)
+        {
+            caughtLogicError = true;
+        }
+    };
+
+    loop.Run(root());
+    REQUIRE(caughtLogicError);
 }

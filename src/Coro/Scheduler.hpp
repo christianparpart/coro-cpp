@@ -36,10 +36,13 @@ class IScheduler
     /// Detach a `Task<void>` onto this scheduler and drive it to
     /// completion alongside other tasks.
     ///
-    /// Ownership of the coroutine frame transfers to the scheduler: the
-    /// task is released and its raw handle posted to the run queue. The
-    /// coroutine self-destroys at `final_suspend` (its continuation is the
-    /// `noop_coroutine`), so the scheduler need not track the frame.
+    /// Ownership of the coroutine frame transfers to the frame itself: the
+    /// task is released, its promise is marked *detached*, and the raw
+    /// handle is posted to the run queue. At `final_suspend` the detached
+    /// frame self-destroys (see `Detail::TaskPromiseBase::FinalAwaiter`),
+    /// so the scheduler need not track it. An exception escaping a
+    /// detached task has no `co_await` site to surface at and calls
+    /// `std::terminate` — mirroring `std::thread`'s fail-loud policy.
     ///
     /// This is the member-API counterpart to the free function
     /// @ref Spawn, letting callers write `scheduler.Post(task())` instead
@@ -51,7 +54,9 @@ class IScheduler
     ///             moved-from on return.
     void Post(Task<void>&& task)
     {
-        Post(std::move(task).Release());
+        auto const handle = std::move(task).Release();
+        handle.promise().detached = true;
+        Post(handle);
     }
 
     /// Schedule a continuation to be resumed at (or shortly after) the

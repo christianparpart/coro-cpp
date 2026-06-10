@@ -3,6 +3,7 @@
 
 #include <coroutine>
 #include <exception>
+#include <stdexcept>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -52,18 +53,23 @@ namespace Coro
 /// from the `co_await` expression. If the body throws, the exception is
 /// captured (`unhandled_exception`) and re-thrown at the point of
 /// `co_await` — so `try { co_await t(); } catch (...)` works as you would
-/// expect across the suspension boundary.
+/// expect across the suspension boundary. A *detached* task (one handed
+/// to a scheduler via @ref Spawn / `IScheduler::Post(Task<void>&&)`) has
+/// no `co_await` site to surface at; an exception escaping it calls
+/// `std::terminate`, mirroring `std::thread`'s fail-loud policy.
 ///
 /// @par Ownership (move-only, RAII)
 /// Tasks are move-only and own their coroutine frame: the destructor
 /// destroys the frame if it still holds one. Awaiting a Task is the
 /// canonical way to consume it — the `co_await` expression yields a
-/// @ref Task::Awaiter that *takes ownership* of the coroutine handle for
-/// the duration of the suspension and destroys it when the
+/// @ref Detail::TaskAwaiter that *takes ownership* of the coroutine
+/// handle for the duration of the suspension and destroys it when the
 /// full-expression ends. This is the RAII seam the project's AGENT.md
 /// calls out: because `operator co_await` is rvalue-qualified and steals
 /// the handle, a stray temporary `Task` cannot tear the coroutine down
-/// across a suspend point.
+/// across a suspend point. Detached tasks own themselves: their frame is
+/// reclaimed at `final_suspend` (see
+/// @ref Detail::TaskPromiseBase::detached).
 ///
 /// @par Typical usage
 /// @code
@@ -104,27 +110,38 @@ namespace Detail
     /// `return_value()`/`return_void()` on `co_return`. This base provides
     /// the parts common to both the value and `void` flavours.
     ///
-    /// It holds two pieces of state:
+    /// It holds three pieces of state:
     /// - @ref continuation — who to resume when this task finishes, set by
     ///   the awaiter when the task is `co_await`-ed;
     /// - @ref exception — an exception escaping the body, stashed for
-    ///   re-throw at the awaiting `co_await`.
+    ///   re-throw at the awaiting `co_await`;
+    /// - @ref detached — whether the frame owns itself and must self-destroy
+    ///   at `final_suspend` (set when the task is handed to a scheduler).
     struct TaskPromiseBase
     {
         /// The coroutine to resume once this task completes (its caller /
         /// awaiter). Defaults to `std::noop_coroutine()` — a do-nothing
         /// handle — so that a task which finishes without ever having been
-        /// awaited (e.g. a detached/spawned root) transfers into a safe
-        /// no-op instead of an invalid handle.
+        /// awaited transfers into a safe no-op instead of an invalid
+        /// handle.
         std::coroutine_handle<> continuation { std::noop_coroutine() };
 
         /// Exception captured by `unhandled_exception()` if the body threw.
         /// Null when the body completed normally. Re-thrown by the
-        /// awaiter's `await_resume()`.
+        /// awaiter's `await_resume()` — or, for a detached task, escalated
+        /// to `std::terminate` by the @ref FinalAwaiter.
         std::exception_ptr exception {};
 
+        /// True once the task has been detached onto a scheduler (see
+        /// `IScheduler::Post(Task<void>&&)` / @ref Spawn). A detached frame
+        /// has no owner left — no `Task`, no awaiter — so the
+        /// @ref FinalAwaiter reclaims it at `final_suspend` instead of
+        /// transferring to a continuation.
+        bool detached { false };
+
         /// Awaiter returned from `final_suspend()` that performs *symmetric
-        /// transfer* to the continuation.
+        /// transfer* to the continuation — or, for detached tasks, reclaims
+        /// the coroutine frame.
         ///
         /// The trick is in `await_suspend`: by returning another coroutine
         /// handle (the continuation), the C++ runtime tail-resumes directly
@@ -140,15 +157,42 @@ namespace Detail
                 return false;
             }
 
-            /// Hands control to the finished task's continuation.
+            /// Hands control to the finished task's continuation, or — for
+            /// a detached task — destroys the frame, since no awaiter will
+            /// ever consume it.
             /// @param self Handle to the just-finished coroutine, used to
             ///             reach its promise (and thus its continuation).
             /// @return The continuation handle; the runtime immediately
             ///         resumes it (symmetric transfer, no stack growth).
+            ///         For detached tasks, `std::noop_coroutine()` after
+            ///         the frame has been destroyed.
             template <typename Promise>
-            std::coroutine_handle<> await_suspend(std::coroutine_handle<Promise> self) noexcept
+            [[nodiscard]] std::coroutine_handle<> await_suspend(std::coroutine_handle<Promise> self) const noexcept
             {
-                return self.promise().continuation;
+                auto& promise = self.promise();
+                if (!promise.detached)
+                    return promise.continuation;
+
+                // Detached task: nobody owns this frame anymore, so it must
+                // reclaim itself now — destroying here (while suspended at
+                // the final suspend point) is the standard-sanctioned spot.
+                auto exception = std::move(promise.exception);
+                self.destroy();
+                if (exception)
+                {
+                    // No co_await site exists to rethrow at. Fail loudly —
+                    // mirroring std::thread — with the exception active so
+                    // the terminate handler can report what was thrown.
+                    try
+                    {
+                        std::rethrow_exception(std::move(exception));
+                    }
+                    catch (...)
+                    {
+                        std::terminate();
+                    }
+                }
+                return std::noop_coroutine();
             }
 
             /// Never observed — the task is done; provided to satisfy the
@@ -236,33 +280,58 @@ namespace Detail
         void return_void() const noexcept {}
     };
 
-    /// Common awaiter machinery shared by `Task<T>::Awaiter` and
-    /// `Task<void>::Awaiter`.
+    /// Awaiter produced by `co_await task` (see `Task::operator co_await`).
     ///
-    /// When you write `co_await someTask`, the compiler asks the resulting
-    /// awaiter three questions in turn:
+    /// When you write `co_await someTask`, the compiler asks this awaiter
+    /// three questions in turn:
     /// 1. `await_ready()` — is the result already available? If so, skip
     ///    suspending.
     /// 2. `await_suspend(continuation)` — the awaiting coroutine is about
     ///    to suspend; do the wiring and decide who runs next.
     /// 3. `await_resume()` — produce the value of the `co_await` expression
-    ///    when control comes back (implemented in the derived awaiters,
-    ///    since it depends on whether `T` is `void`).
+    ///    when control comes back.
     ///
-    /// This base implements (1) and (2): it records the awaiting coroutine
-    /// as the awaited task's continuation, then transfers control *into*
-    /// the awaited task — so awaiting a lazy task is what actually starts
-    /// it running.
+    /// It records the awaiting coroutine as the awaited task's
+    /// continuation, then transfers control *into* the awaited task — so
+    /// awaiting a lazy task is what actually starts it running.
+    ///
+    /// The awaiter *owns* the awaited coroutine frame for the duration of
+    /// the suspension: the rvalue `Task` that produced it is left empty
+    /// (see `Task::operator co_await`) so its destructor cannot tear the
+    /// coroutine down underneath us mid-await, and the awaiter destroys
+    /// the frame when the full-expression ends. Move-only and
+    /// non-assignable to keep that single-owner invariant.
     ///
     /// @tparam T Result type of the awaited task.
     template <typename T>
-    class TaskAwaiterBase
+    class TaskAwaiter
     {
       public:
-        /// @param handle Handle to the awaited task's coroutine frame.
-        explicit TaskAwaiterBase(std::coroutine_handle<TaskPromise<T>> handle) noexcept:
+        /// @param handle Handle to the awaited task's frame; ownership is
+        ///               taken for the duration of the await.
+        explicit TaskAwaiter(std::coroutine_handle<TaskPromise<T>> handle) noexcept:
             _handle { handle }
         {
+        }
+
+        TaskAwaiter(TaskAwaiter const&) = delete;
+        TaskAwaiter& operator=(TaskAwaiter const&) = delete;
+
+        /// Move-constructs, transferring frame ownership and leaving
+        /// @p other owning no frame.
+        /// @param other The awaiter to move from.
+        TaskAwaiter(TaskAwaiter&& other) noexcept:
+            _handle { std::exchange(other._handle, {}) }
+        {
+        }
+        TaskAwaiter& operator=(TaskAwaiter&&) = delete;
+
+        /// Destroys the owned coroutine frame at the end of the
+        /// full-expression containing the `co_await`.
+        ~TaskAwaiter()
+        {
+            if (_handle)
+                _handle.destroy();
         }
 
         /// @return `true` if there is nothing to wait for — the handle is
@@ -286,23 +355,38 @@ namespace Detail
             return _handle;
         }
 
-      protected:
-        /// @return The handle to the awaited coroutine frame.
-        [[nodiscard]] std::coroutine_handle<TaskPromise<T>> Coroutine() const noexcept
+        /// Produces the value of the `co_await` expression once the awaited
+        /// task has finished.
+        ///
+        /// Awaiting an *empty* Task (default-constructed, moved-from, or
+        /// already awaited once) is well-defined: `Task<void>` completes
+        /// immediately as an already-finished task would, while a
+        /// value-producing `Task<T>` has no value to yield and therefore
+        /// reports the contract misuse by throwing.
+        /// @return The value the awaited task produced via `co_return`
+        ///         (nothing for `T = void`).
+        /// @throws std::logic_error When awaiting an empty `Task<T>` with
+        ///         non-void `T` — there is no value to produce.
+        /// @throws Re-throws any exception that escaped the awaited task's
+        ///         body, so it surfaces at the `co_await` site.
+        T await_resume()
         {
-            return _handle;
-        }
-
-        /// Re-point this awaiter at a different coroutine frame. Used by the
-        /// derived awaiters' move constructors to keep the base handle in
-        /// sync with the moved-in owned handle.
-        /// @param handle The new coroutine handle.
-        void SetCoroutine(std::coroutine_handle<TaskPromise<T>> handle) noexcept
-        {
-            _handle = handle;
+            if (!_handle)
+            {
+                if constexpr (std::is_void_v<T>)
+                    return; // empty Task<void> == already-completed task
+                else
+                    throw std::logic_error { "co_await on an empty Coro::Task<T> has no value to produce" };
+            }
+            auto& promise = _handle.promise();
+            if (promise.exception)
+                std::rethrow_exception(promise.exception);
+            if constexpr (!std::is_void_v<T>)
+                return std::move(std::get<1>(promise.result));
         }
 
       private:
+        /// The frame this awaiter owns and will destroy.
         std::coroutine_handle<TaskPromise<T>> _handle;
     };
 
@@ -321,9 +405,16 @@ class Task
     /// Strongly-typed handle to this task's coroutine frame.
     using Handle = std::coroutine_handle<promise_type>;
 
-    /// Constructs an empty Task that owns no coroutine frame. Awaiting or
-    /// inspecting it behaves as an already-completed task (`IsReady()` is
-    /// `true`).
+    /// Awaiter produced by `co_await task`; owns the frame for the
+    /// duration of the await. See @ref Detail::TaskAwaiter.
+    using Awaiter = Detail::TaskAwaiter<T>;
+
+    /// Constructs an empty Task that owns no coroutine frame. Inspecting
+    /// it behaves as an already-completed task (`IsReady()` is `true`).
+    /// Awaiting an empty `Task<void>` completes immediately; awaiting an
+    /// empty `Task<T>` with non-void `T` throws `std::logic_error`, since
+    /// there is no value to produce (see
+    /// @ref Detail::TaskAwaiter::await_resume).
     Task() noexcept = default;
 
     /// Wraps an existing coroutine handle, taking ownership of its frame.
@@ -397,72 +488,13 @@ class Task
     /// After this call the Task is empty and its destructor will not touch
     /// the frame — the caller is now responsible for resuming it to
     /// completion and/or destroying it. This is how @ref Spawn hands a
-    /// task to a scheduler: the scheduler owns the frame and destroys it
-    /// when the task finishes.
+    /// task to a scheduler: the promise is marked detached, so the frame
+    /// reclaims itself at `final_suspend`.
     /// @return The released handle (possibly null).
     [[nodiscard]] Handle Release() noexcept
     {
         return std::exchange(_handle, {});
     }
-
-    /// Awaiter produced by `co_await task`.
-    ///
-    /// It takes ownership of the coroutine handle for the duration of the
-    /// suspension; the rvalue `Task` that produced it is left empty (see
-    /// @ref Task::operator co_await) so its destructor cannot tear the
-    /// coroutine down underneath us mid-await. The awaiter destroys the
-    /// handle when the full-expression ends. Move-only and non-assignable
-    /// to keep that single-owner invariant.
-    ///
-    /// @see Detail::TaskAwaiterBase for the `await_ready`/`await_suspend`
-    ///      half of the protocol.
-    class Awaiter: public Detail::TaskAwaiterBase<T>
-    {
-      public:
-        /// @param handle Handle to the awaited task's frame; ownership is
-        ///               taken for the duration of the await.
-        explicit Awaiter(Handle handle) noexcept:
-            Detail::TaskAwaiterBase<T> { handle }
-        {
-        }
-        Awaiter(Awaiter const&) = delete;
-        Awaiter& operator=(Awaiter const&) = delete;
-
-        /// Move-constructs, transferring frame ownership and keeping the
-        /// base class's handle in sync.
-        /// @param other The awaiter to move from; left owning no frame.
-        Awaiter(Awaiter&& other) noexcept:
-            Detail::TaskAwaiterBase<T> { std::exchange(other._owned, Handle {}) }
-        {
-            this->SetCoroutine(_owned);
-        }
-        Awaiter& operator=(Awaiter&&) = delete;
-
-        /// Destroys the owned coroutine frame at the end of the
-        /// full-expression containing the `co_await`.
-        ~Awaiter()
-        {
-            if (_owned)
-                _owned.destroy();
-        }
-
-        /// Produces the value of the `co_await` expression once the awaited
-        /// task has finished.
-        /// @return The value the awaited task produced via `co_return`.
-        /// @throws Re-throws any exception that escaped the awaited task's
-        ///         body, so it surfaces at the `co_await` site.
-        T await_resume()
-        {
-            auto& promise = this->Coroutine().promise();
-            if (promise.exception)
-                std::rethrow_exception(promise.exception);
-            return std::move(std::get<1>(promise.result));
-        }
-
-      private:
-        /// The frame this awaiter owns and will destroy.
-        Handle _owned { this->Coroutine() };
-    };
 
     /// Makes a Task awaitable. Rvalue-qualified so you can only await a
     /// Task you own outright (a temporary or an explicitly `std::move`-d
@@ -470,134 +502,6 @@ class Task
     /// frame. The handle is stolen into the returned @ref Awaiter, leaving
     /// this Task empty.
     /// @return An @ref Awaiter owning this task's frame.
-    Awaiter operator co_await() && noexcept
-    {
-        return Awaiter { std::exchange(_handle, {}) };
-    }
-
-  private:
-    /// The owned coroutine frame, or null when empty / moved-from.
-    Handle _handle {};
-};
-
-/// Specialization of @ref Task for coroutines that produce no value.
-///
-/// Behaves exactly like `Task<T>` — same laziness, ownership, symmetric
-/// transfer and exception propagation — except the body ends with
-/// `co_return;` (or falls off the end) and `co_await`-ing it yields no
-/// value. This is the common type for fire-and-forget work spawned onto a
-/// scheduler (see @ref Spawn).
-template <>
-class Task<void>
-{
-  public:
-    /// @copydoc Task::promise_type
-    using promise_type = Detail::TaskPromise<void>;
-
-    /// @copydoc Task::Handle
-    using Handle = std::coroutine_handle<promise_type>;
-
-    /// @copydoc Task::Task()
-    Task() noexcept = default;
-
-    /// @copydoc Task::Task(Handle)
-    explicit Task(Handle handle) noexcept:
-        _handle { handle }
-    {
-    }
-
-    /// Tasks are non-copyable — a coroutine frame has a single owner.
-    Task(Task const&) = delete;
-    /// Tasks are non-copyable — a coroutine frame has a single owner.
-    Task& operator=(Task const&) = delete;
-
-    /// @copydoc Task::Task(Task&&)
-    Task(Task&& other) noexcept:
-        _handle { std::exchange(other._handle, {}) }
-    {
-    }
-
-    /// @copydoc Task::operator=(Task&&)
-    Task& operator=(Task&& other) noexcept
-    {
-        if (this != &other)
-        {
-            if (_handle)
-                _handle.destroy();
-            _handle = std::exchange(other._handle, {});
-        }
-        return *this;
-    }
-
-    /// @copydoc Task::~Task
-    ~Task()
-    {
-        if (_handle)
-            _handle.destroy();
-    }
-
-    /// @copydoc Task::IsReady
-    [[nodiscard]] bool IsReady() const noexcept
-    {
-        return !_handle || _handle.done();
-    }
-
-    /// @copydoc Task::Native
-    [[nodiscard]] Handle Native() const noexcept
-    {
-        return _handle;
-    }
-
-    /// @copydoc Task::Release
-    [[nodiscard]] Handle Release() noexcept
-    {
-        return std::exchange(_handle, {});
-    }
-
-    /// Awaiter produced by `co_await task` for a `Task<void>`. Identical to
-    /// @ref Task::Awaiter except `await_resume` yields nothing.
-    class Awaiter: public Detail::TaskAwaiterBase<void>
-    {
-      public:
-        /// @copydoc Task::Awaiter::Awaiter(Handle)
-        explicit Awaiter(Handle handle) noexcept:
-            Detail::TaskAwaiterBase<void> { handle }
-        {
-        }
-        Awaiter(Awaiter const&) = delete;
-        Awaiter& operator=(Awaiter const&) = delete;
-
-        /// @copydoc Task::Awaiter::Awaiter(Awaiter&&)
-        Awaiter(Awaiter&& other) noexcept:
-            Detail::TaskAwaiterBase<void> { std::exchange(other._owned, Handle {}) }
-        {
-            this->SetCoroutine(_owned);
-        }
-        Awaiter& operator=(Awaiter&&) = delete;
-
-        /// @copydoc Task::Awaiter::~Awaiter
-        ~Awaiter()
-        {
-            if (_owned)
-                _owned.destroy();
-        }
-
-        /// Completes the `co_await` expression. Produces no value.
-        /// @throws Re-throws any exception that escaped the awaited task's
-        ///         body, so it surfaces at the `co_await` site.
-        void await_resume()
-        {
-            auto& promise = this->Coroutine().promise();
-            if (promise.exception)
-                std::rethrow_exception(promise.exception);
-        }
-
-      private:
-        /// The frame this awaiter owns and will destroy.
-        Handle _owned { this->Coroutine() };
-    };
-
-    /// @copydoc Task::operator co_await
     Awaiter operator co_await() && noexcept
     {
         return Awaiter { std::exchange(_handle, {}) };
