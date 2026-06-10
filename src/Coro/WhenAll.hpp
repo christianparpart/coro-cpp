@@ -4,7 +4,6 @@
 #include <Coro/Scheduler.hpp>
 #include <Coro/Task.hpp>
 
-#include <atomic>
 #include <cassert>
 #include <coroutine>
 #include <cstddef>
@@ -28,6 +27,8 @@ namespace Detail
     template <typename T>
     struct WhenAllSlot
     {
+        /// The child task's result type (`void` for value-less children).
+        using Value = T;
         using Stored = std::conditional_t<std::is_void_v<T>, std::monostate, std::optional<T>>;
 
         Task<T> task;
@@ -130,9 +131,9 @@ class WhenAllAwaitable
         SpawnChildren(std::index_sequence_for<Ts...> {});
     }
 
-    /// Collect the children's results into a tuple. Voids are
-    /// represented as `std::monostate` slots and dropped from the
-    /// returned tuple type via `MakeReturn`.
+    /// Collect the children's results into a tuple. Void children are
+    /// folded out of the returned tuple type by `MakeReturn`, so they
+    /// contribute completion (and exceptions) but no tuple element.
     auto await_resume()
     {
         return MakeReturn(std::index_sequence_for<Ts...> {});
@@ -151,15 +152,16 @@ class WhenAllAwaitable
     }
 
     /// Build the tuple of return values, propagating any exception
-    /// from the first slot that holds one. Voids are folded out of
-    /// the tuple so `WhenAll(Task<int>, Task<void>, Task<string>)`
-    /// resolves to `tuple<int, string>` rather than including a
-    /// `monostate`.
+    /// from the first slot that holds one. Each child contributes a
+    /// tuple piece — a one-element tuple for value children, an empty
+    /// tuple for void children — and `std::tuple_cat` folds the voids
+    /// out, so `WhenAll(Task<int>, Task<void>, Task<string>)` resolves
+    /// to `tuple<int, string>` rather than including a `monostate`.
     template <std::size_t... Is>
     auto MakeReturn(std::index_sequence<Is...> /*indices*/)
     {
         (RethrowIfFailed<Is>(), ...);
-        return std::tuple { ExtractValue<Is>()... };
+        return std::tuple_cat(ExtractValue<Is>()...);
     }
 
     template <std::size_t I>
@@ -170,22 +172,25 @@ class WhenAllAwaitable
             std::rethrow_exception(slot.exception);
     }
 
+    /// @return This child's contribution to the result tuple: a
+    ///         one-element tuple holding its value, or an empty tuple
+    ///         for a `Task<void>` child (folded away by `tuple_cat`).
     template <std::size_t I>
     auto ExtractValue()
     {
         using SlotType = std::tuple_element_t<I, std::tuple<Detail::WhenAllSlot<Ts>...>>;
-        auto& slot = std::get<I>(*_slots);
-        if constexpr (std::is_same_v<typename SlotType::Stored, std::monostate>)
-            return std::monostate {};
+        if constexpr (std::is_void_v<typename SlotType::Value>)
+            return std::tuple<> {};
         else
         {
+            auto& slot = std::get<I>(*_slots);
             // The slot is always engaged here: a non-void child either
             // emplaced its result or stored an exception that
             // `RethrowIfFailed` already re-threw before we extract. The
             // explicit `has_value` guard documents that invariant and
             // keeps the access checked.
             assert(slot.result.has_value());
-            return std::move(slot.result.value());
+            return std::tuple<typename SlotType::Value> { std::move(slot.result).value() };
         }
     }
 
