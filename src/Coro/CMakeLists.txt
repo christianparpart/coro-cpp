@@ -22,6 +22,7 @@ target_sources(Coro
             ManualScheduler.hpp
             Sleep.hpp
             TimerQueue.hpp
+            TracingScheduler.hpp
             WhenAll.hpp
             WhenAny.hpp
             Spawn.hpp
