@@ -26,8 +26,11 @@ target_link_libraries(CoroTest
 # Catch2's TEST_CASE macro expands `__COUNTER__`, which recent clang
 # considers a C2y extension. Disable -Wc2y-extensions on the test
 # binary so -Werror doesn't trip on third-party macro hygiene — our
-# own code in src/Coro is unaffected.
-target_compile_options(CoroTest PRIVATE -Wno-c2y-extensions)
+# own code in src/Coro is unaffected. (Clang/GCC flag; MSVC has no
+# equivalent and would reject the option.)
+if(NOT MSVC)
+    target_compile_options(CoroTest PRIVATE -Wno-c2y-extensions)
+endif()
 
 # Silence clang-tidy on the Catch2 generated headers via the project
 # helper (the test binary itself stays under tidy via the global setup).
