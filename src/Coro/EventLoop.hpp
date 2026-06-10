@@ -4,11 +4,10 @@
 #include <Coro/Clock.hpp>
 #include <Coro/Scheduler.hpp>
 #include <Coro/Task.hpp>
+#include <Coro/TimerQueue.hpp>
 
 #include <coroutine>
-#include <cstddef>
 #include <deque>
-#include <vector>
 
 namespace Coro
 {
@@ -18,7 +17,8 @@ namespace Coro
 ///
 /// The loop holds two data structures:
 ///   * a FIFO ready-queue of coroutine handles to resume next;
-///   * a min-heap of (deadline, handle) timer entries.
+///   * a `TimerQueue` of (deadline, handle) timer entries — the shared
+///     min-heap every timer-capable scheduler in this library composes.
 ///
 /// Each iteration: drain the ready-queue, then wait until the next
 /// timer is due. When a timer fires its handle is moved from the heap
@@ -79,33 +79,13 @@ class EventLoop final: public IScheduler
     bool RunOnce();
 
   private:
-    struct TimerEntry
-    {
-        IClock::TimePoint when {};
-        std::coroutine_handle<> handle {};
-        std::size_t sequence { 0 }; ///< FIFO tiebreak for same-deadline entries.
-    };
-
-    /// Strict-weak ordering for the timer min-heap (latest first, so
-    /// `std::pop_heap` yields the earliest deadline).
-    struct TimerLater
-    {
-        [[nodiscard]] bool operator()(TimerEntry const& a, TimerEntry const& b) const noexcept
-        {
-            if (a.when != b.when)
-                return a.when > b.when;
-            return a.sequence > b.sequence;
-        }
-    };
-
     /// Pop timers whose deadline has elapsed and move their handles to
     /// the ready queue.
     void DrainExpiredTimers();
 
     IClock& _clock;
     std::deque<std::coroutine_handle<>> _ready;
-    std::vector<TimerEntry> _timers;
-    std::size_t _nextTimerSequence { 0 };
+    TimerQueue _timers;
 };
 
 } // namespace Coro

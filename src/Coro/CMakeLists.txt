@@ -19,6 +19,7 @@ target_sources(Coro
             Clock.hpp
             EventLoop.hpp
             Sleep.hpp
+            TimerQueue.hpp
             WhenAll.hpp
             WhenAny.hpp
             Spawn.hpp

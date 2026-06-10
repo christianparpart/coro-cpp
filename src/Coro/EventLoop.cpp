@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <Coro/EventLoop.hpp>
 
-#include <algorithm>
 #include <cassert>
 #include <cstddef>
 #include <exception>
@@ -23,20 +22,14 @@ void EventLoop::Post(std::coroutine_handle<> handle)
 
 void EventLoop::ScheduleAt(IClock::TimePoint when, std::coroutine_handle<> handle)
 {
-    _timers.push_back(TimerEntry { .when = when, .handle = handle, .sequence = _nextTimerSequence++ });
-    std::ranges::push_heap(_timers, TimerLater {});
+    _timers.Schedule(when, handle);
 }
 
 void EventLoop::DrainExpiredTimers()
 {
     auto const now = _clock.Now();
-    while (!_timers.empty() && _timers.front().when <= now)
-    {
-        std::ranges::pop_heap(_timers, TimerLater {});
-        auto entry = _timers.back();
-        _timers.pop_back();
-        _ready.push_back(entry.handle);
-    }
+    while (auto const due = _timers.PopDue(now))
+        _ready.push_back(due.value().handle);
 }
 
 bool EventLoop::RunOnce()
@@ -78,13 +71,14 @@ void EventLoop::Run(Task<void> root)
             continue;
         }
 
-        if (_timers.empty())
+        auto const next = _timers.NextDeadline();
+        if (!next)
             break; // nothing ready, no future timers — loop has drained.
 
         // Wait for the next timer through the injected clock seam:
         // SystemClock sleeps the thread, a manual test clock jumps
         // straight to the deadline (keeping tests deterministic).
-        _clock.WaitUntil(_timers.front().when);
+        _clock.WaitUntil(next.value());
     }
 
     // Reclaim the root frame first so it (and everything it owns) is
