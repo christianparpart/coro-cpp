@@ -8,7 +8,9 @@ coroutine handles) into a handful of building blocks you can actually use:
 - **Awaitables** — the things you `co_await` (`Sleep`, `WhenAll`, `WhenAny`,
   or your own).
 - **`IScheduler` / `EventLoop`** — the cooperative runtime that drives
-  suspended coroutines to completion.
+  suspended coroutines to completion, with drop-in alternatives: a
+  virtual-time scheduler for tests, a tracing decorator, and a Win32
+  message-pump adapter.
 - **`Spawn`** — fire-and-forget a background coroutine.
 
 The goal is that asynchronous code reads like ordinary, straight-line code
@@ -89,8 +91,8 @@ You consume a `Task` in one of two ways:
   }
   ```
 - **Hand it to a scheduler** to run it as a top-level / background task
-  (see [`Spawn`](#spawn--fire-and-forget) and
-  [`EventLoop::Run`](#running-it-the-scheduler)).
+  (see [`Spawn`](#spawn--schedulerpost--fire-and-forget) and
+  [`EventLoop::Run`](#running-it--the-scheduler)).
 
 If the body throws, the exception is captured and **re-thrown at the
 `co_await` site**, so ordinary `try`/`catch` works across suspension
@@ -99,8 +101,199 @@ points.
 > **No stack overflow from deep chains.** When a task finishes it performs
 > *symmetric transfer* — it tail-resumes directly into whoever awaited it
 > instead of returning up the C++ call stack. A chain of a million
-> `co_await`s runs in constant stack space. (See the heavily-commented
-> [`src/Coro/Task.hpp`](src/Coro/Task.hpp) if you want the mechanics.)
+> `co_await`s runs in constant stack space. (The next section explains
+> the mechanism.)
+
+---
+
+## How C++23 coroutines actually work
+
+You can use `Coro` without reading this section — but coroutines stop
+being mysterious (and become much harder to misuse) once you know what
+the compiler actually does with them. C++ ships only the *mechanics* of
+coroutines: three keywords and a set of customization points. There is
+**no** task type, no event loop, no `sleep` in the standard library —
+libraries like this one supply those. Everything below is illustrated
+with `Coro::Task`, and every claim can be checked against the
+heavily-commented [`src/Coro/Task.hpp`](src/Coro/Task.hpp).
+
+### A coroutine is a rewritten function
+
+A function *is* a coroutine if its body contains at least one `co_await`,
+`co_return`, or `co_yield`. Nothing in the signature says so — instead,
+the **return type** decides how the coroutine behaves, by exposing a
+nested `promise_type` (for `Task<T>` that is `Detail::TaskPromise<T>`).
+The compiler rewrites the body into a resumable state machine around
+that promise. Conceptually:
+
+```cpp
+Coro::Task<int> answer()
+{
+    co_return 42;
+}
+
+// ...is rewritten by the compiler into (simplified pseudo-code):
+Coro::Task<int> answer()
+{
+    // 1. Allocate the coroutine frame. Parameters, locals, the promise
+    //    object and the "where to resume" bookmark all live inside it.
+    auto* frame = new __answer_frame {};
+
+    // 2. Ask the promise for the object the caller receives.
+    Coro::Task<int> task = frame->promise.get_return_object();
+
+    // 3. initial_suspend(): Task's promise returns std::suspend_always,
+    //    so the coroutine suspends *before its first statement* and the
+    //    caller gets the still-lazy `task` back.
+    co_await frame->promise.initial_suspend();
+
+    // ---- everything below runs only once somebody resumes the task ----
+
+    try
+    {
+        frame->promise.return_value(42);            // co_return 42;
+    }
+    catch (...)
+    {
+        frame->promise.unhandled_exception();       // capture, don't crash
+    }
+
+    // 4. final_suspend(): suspend one last time (so the stored result
+    //    outlives the body) and hand control to whoever awaited us.
+    co_await frame->promise.final_suspend();
+}
+```
+
+### The coroutine frame and `std::coroutine_handle`
+
+The **frame** is the coroutine's activation record, allocated when the
+coroutine is first called. It holds the parameters (copied/moved in),
+every local variable that lives across a suspension point, the promise
+object, and a bookmark recording where to resume. *Suspending* means
+"write the bookmark, return to whoever resumed us"; *resuming* means
+"jump back to the bookmark". No threads, no signals, no magic — a
+suspended coroutine is just a heap object waiting for someone to call
+`resume()` on it.
+
+`std::coroutine_handle<>` is a type-erased, **non-owning** pointer to a
+frame with three operations:
+
+```cpp
+handle.resume();    // continue executing at the bookmark
+handle.done();      // is the body finished (suspended at final_suspend)?
+handle.destroy();   // free the frame
+```
+
+It behaves like a raw pointer: trivially copyable, no lifetime tracking.
+Every use-after-free and double-destroy hazard of coroutines lives in
+this type — which is why `Coro` wraps handles in single-owner RAII types
+(`Task`, its awaiter) and why schedulers only ever *borrow* handles. The
+typed variant `std::coroutine_handle<Promise>` additionally converts
+between handle and promise (`.promise()`,
+`std::coroutine_handle<Promise>::from_promise(p)`), which is how a
+finished task finds its continuation.
+
+### The promise — the coroutine's control block
+
+The promise is the customization hub: the compiler calls a fixed set of
+hooks on it at well-defined points, and the answers define the coroutine
+type's entire personality. `Task`'s promise
+([`Detail::TaskPromise<T>`](src/Coro/Task.hpp)) answers like this:
+
+| Hook | Compiler calls it | What `Task`'s promise does |
+| --- | --- | --- |
+| `get_return_object()` | Once, at the initial call. | Builds the `Task<T>` that owns the frame. |
+| `initial_suspend()` | Before the body's first statement. | Returns `std::suspend_always` — **this one line is why `Task` is lazy.** |
+| `return_value(v)` / `return_void()` | At `co_return`. | Stores the result inside the promise. |
+| `unhandled_exception()` | When an exception escapes the body. | Captures `std::current_exception()` for re-throw at the `co_await` site. |
+| `final_suspend()` | After the body finishes. | Returns a `FinalAwaiter` that transfers control to the continuation (see below). |
+
+An *eager* task library would return `std::suspend_never` from
+`initial_suspend()` and the body would start running immediately at the
+call. `Task` deliberately chooses lazy: a task can be created, moved,
+stored, and composed (`WhenAll(a(), b())`) before any of its code runs,
+and a task that is never awaited simply frees its frame without side
+effects.
+
+### What a `co_await` expression compiles into
+
+`co_await` is a negotiation between the suspending coroutine and the
+*awaiter* object. The expression `auto v = co_await expr;` expands
+roughly to:
+
+```cpp
+auto&& awaiter = /* expr, or expr.operator co_await() if it has one */;
+
+if (!awaiter.await_ready())                  // 1. result already there? then don't suspend
+{
+    /* suspend: write the resume bookmark into the frame */
+    awaiter.await_suspend(thisHandle);       // 2. hand over the continuation
+    /* control leaves this coroutine — back to the resumer/scheduler */
+    /* ...time passes... someone calls thisHandle.resume() */
+}
+
+auto v = awaiter.await_resume();             // 3. value of the co_await expression
+```
+
+Two details matter in practice:
+
+- The coroutine is *already suspended* when `await_suspend` runs. That is
+  what makes it safe for the awaiter to hand the continuation to a timer
+  queue, another thread, or an OS callback that might resume it
+  immediately.
+- `await_suspend`'s return type steers what runs next: `void` (return to
+  the resumer), `bool` (`false` = cancel the suspension), or a
+  `std::coroutine_handle<>` (resume *that* coroutine right now). The
+  three forms are tabulated in
+  [Awaitables](#awaitables--what-you-can-co_await) below.
+
+### Symmetric transfer — chaining without stack growth
+
+When `await_suspend` returns a `std::coroutine_handle<>`, the runtime
+resumes that handle **as a tail call**: the current resume call returns
+and the new coroutine starts in its place, without growing the C++ call
+stack. `Task` uses this trick in both directions:
+
+```text
+parent: co_await child()                 child's body finishes
+   │ parent suspends                        │ child suspends at final_suspend()
+   ▼                                        ▼
+TaskAwaiter::await_suspend           FinalAwaiter::await_suspend
+   records parent as the                reads promise.continuation
+   child's continuation,
+   returns child's handle ──────▶       returns parent's handle ──────▶ parent resumes;
+      (tail-resume: this is what           (tail-resume: result            await_resume()
+       *starts* the lazy child)             delivery, no stack)            yields the value
+```
+
+Every `──▶` is a tail-resume, not a nested function call — so an await
+chain a million tasks deep still runs in constant stack space. Without
+symmetric transfer (i.e. with `await_suspend` returning `void` and
+someone calling `resume()` recursively), each link would add a stack
+frame and deep chains would overflow.
+
+### Who destroys the frame?
+
+`coroutine_handle::destroy()` must be called exactly once per frame.
+`Coro` makes that a single-owner discipline with three states:
+
+| State of the task | Owner of the frame | Frame is destroyed by |
+| --- | --- | --- |
+| Created, not yet consumed | The `Task<T>` object. | `Task`'s destructor (or move-assignment over it). |
+| Being `co_await`-ed | The `TaskAwaiter` — the rvalue-qualified `operator co_await()` *steals* the handle, leaving the `Task` empty. | The awaiter, at the end of the `co_await` full-expression. |
+| Detached (`Spawn` / `scheduler.Post(std::move(task))`) | The frame itself (`promise.detached == true`). | `FinalAwaiter`, immediately after the body finishes. |
+
+The hand-offs exist for a reason: stealing the handle into the awaiter
+means a temporary `Task` destroyed mid-`co_await` cannot tear the frame
+down underneath the suspension, and detached frames self-destroying at
+`final_suspend` means schedulers never have to track ownership at all —
+they only ever borrow handles.
+
+That is the entire language feature: a rewritten function body, a frame,
+a handle, a promise with hooks, and the awaiter protocol. Everything
+else — tasks, sleeping, racing, event loops — is library code, and
+[`src/Coro/Task.hpp`](src/Coro/Task.hpp) walks through all of it with a
+comment on every step.
 
 ---
 
@@ -232,7 +425,69 @@ sched.Post(store(sched, myResult));   // now it's a Task<void> — fine to detac
 The rule of thumb: **`Post`/`Spawn` for side effects, `co_await` (directly
 or through `WhenAll`/`WhenAny`) for results.**
 
-## Writing your own awaitable
+---
+
+## Running it — the scheduler
+
+Coroutines are inert until something resumes them. `Coro` provides a
+single-threaded, cooperative `EventLoop` (an `IScheduler`) that does the
+driving:
+
+```cpp
+#include <Coro/Clock.hpp>
+#include <Coro/EventLoop.hpp>
+#include <Coro/Task.hpp>
+
+int main()
+{
+    auto clock = Coro::SystemClock{};        // real time source (injected)
+    auto loop  = Coro::EventLoop{clock};
+
+    loop.Run(run(loop));   // drive the root task to completion
+    return 0;
+}
+```
+
+`EventLoop::Run(Task<void> root)` posts the root coroutine and then
+iterates: drain the ready queue of resumable handles, fire any expired
+timers, sleep until the next timer, repeat — until the root task is done or
+the loop runs dry. The time source is the injected `IClock`
+(`SystemClock` in production; a `ManualClock` in tests advances time by
+hand for deterministic, instant tests).
+
+`EventLoop` is only the default `IScheduler`. The library ships three
+more — `ManualScheduler` (virtual time for tests), `TracingScheduler` (a
+decorator that records every scheduling call), and
+`Win32MessageScheduler` (rides a GUI message pump) — covered in
+[Extending Coro](#extending-coro) and
+[Testing coroutine code](#testing-coroutine-code).
+
+Key types at a glance:
+
+| Type | Role |
+| --- | --- |
+| `Coro::Task<T>` | Lazy, awaitable coroutine returning `T`. |
+| `Coro::IScheduler` | Interface awaitables talk to (`Post`, `Post(Task<void>&&)`, `ScheduleAt`, `Clock`). |
+| `Coro::EventLoop` | Concrete single-threaded cooperative scheduler. |
+| `Coro::ManualScheduler` | Virtual-time scheduler for deterministic tests (`RunUntilIdle`, `AdvanceBy`, `AdvanceTo`). |
+| `Coro::TracingScheduler` | Decorator that records every `Post`/`ScheduleAt` on the wrapped scheduler. |
+| `Coro::Win32MessageScheduler` | Scheduler riding an existing Win32 GUI message pump (Windows only). |
+| `Coro::TimerQueue` | Min-heap of (deadline, handle) entries — the timer engine the schedulers compose. |
+| `Coro::IClock` / `SystemClock` | Injected time source. |
+| `Coro::Sleep` | Awaitable: suspend for a duration. |
+| `Coro::WhenAll` | Awaitable: run tasks concurrently, collect all results. |
+| `Coro::WhenAny` | Awaitable: race tasks, take the first. |
+| `Coro::Spawn` | Detach a `Task<void>` onto a scheduler. |
+
+---
+
+## Extending Coro
+
+The library has exactly two extension seams, and they compose freely:
+**awaitables** (new things to put after `co_await`) and **schedulers**
+(new runtimes to drive coroutines). Both are deliberately small.
+
+### Writing your own awaitable
 
 Because the awaiter protocol is open, you can make *anything* awaitable —
 an OS event, a condition variable, a one-shot signal. Here is a minimal
@@ -296,48 +551,198 @@ The recipe is always the same:
 > real wall-clock time. See [`AGENT.md`](AGENT.md) for the project's
 > design rules.
 
----
+### Writing your own scheduler
 
-## Running it — the scheduler
-
-Coroutines are inert until something resumes them. `Coro` provides a
-single-threaded, cooperative `EventLoop` (an `IScheduler`) that does the
-driving:
+Every runtime in `Coro` — including the test and GUI ones — is an
+implementation of the three-method `IScheduler` interface
+([`src/Coro/Scheduler.hpp`](src/Coro/Scheduler.hpp)):
 
 ```cpp
-#include <Coro/Clock.hpp>
-#include <Coro/EventLoop.hpp>
-#include <Coro/Task.hpp>
-
-int main()
+class IScheduler
 {
-    auto clock = Coro::SystemClock{};        // real time source (injected)
-    auto loop  = Coro::EventLoop{clock};
+  public:
+    /// Post a ready continuation to the run queue; resume it on the
+    /// next iteration.
+    virtual void Post(std::coroutine_handle<> handle) = 0;
 
-    loop.Run(run(loop));   // drive the root task to completion
-    return 0;
+    /// Resume `handle` at (or shortly after) `when` on this
+    /// scheduler's clock.
+    virtual void ScheduleAt(IClock::TimePoint when, std::coroutine_handle<> handle) = 0;
+
+    /// The clock awaitables read `Now()` from to compute deadlines.
+    [[nodiscard]] virtual IClock const& Clock() const noexcept = 0;
+};
+```
+
+The contract you must honour:
+
+- **Handles are borrowed.** Never `destroy()` a posted handle — ownership
+  stays with the `Task`/awaiter that scheduled it (detached frames own
+  themselves). Dropping un-run handles on shutdown is fine; destroying
+  them is not.
+- **Single-threaded by default.** Callers run on the loop thread.
+  (`Win32MessageScheduler::Post` is the documented exception — it is
+  safe from any thread because `PostMessage` is.)
+- **The `Task<void>` overload comes free.** `IScheduler` itself provides
+  the non-virtual `Post(Task<void>&&)` convenience (detach + post); add
+  `using IScheduler::Post;` next to your override so it stays visible.
+
+A minimal scheduler is mostly two containers — and the timer half is
+already written for you: `Coro::TimerQueue`
+([`src/Coro/TimerQueue.hpp`](src/Coro/TimerQueue.hpp)) is the min-heap of
+(deadline, handle) entries with FIFO tiebreak that all in-tree schedulers
+compose (`Schedule(when, handle)`, `PopDue(now)`, `NextDeadline()`):
+
+```cpp
+#include <Coro/Scheduler.hpp>
+#include <Coro/TimerQueue.hpp>
+
+#include <coroutine>
+#include <deque>
+
+class MyScheduler final: public Coro::IScheduler
+{
+  public:
+    explicit MyScheduler(Coro::IClock& clock) noexcept: _clock { clock } {}
+
+    using IScheduler::Post; // keep the Task<void>&& convenience overload visible
+
+    void Post(std::coroutine_handle<> handle) override { _ready.push_back(handle); }
+
+    void ScheduleAt(Coro::IClock::TimePoint when, std::coroutine_handle<> handle) override
+    {
+        _timers.Schedule(when, handle);
+    }
+
+    [[nodiscard]] Coro::IClock const& Clock() const noexcept override { return _clock; }
+
+    // Your driving logic goes here: pop _ready front-to-back and resume(),
+    // move due timers (`_timers.PopDue(_clock.Now())`) into _ready, and
+    // decide how to wait until `_timers.NextDeadline()`.
+
+  private:
+    Coro::IClock& _clock;
+    std::deque<std::coroutine_handle<>> _ready;
+    Coro::TimerQueue _timers;
+};
+```
+
+The three non-default schedulers in the tree are worked examples of this
+recipe, each teaching a different lesson:
+
+**`ManualScheduler` — own the clock.**
+([`src/Coro/ManualScheduler.hpp`](src/Coro/ManualScheduler.hpp)) owns a
+*virtual* clock that starts at the epoch and only moves when told to, and
+exposes an Rx-`TestScheduler`-style driving API: `RunUntilIdle()` drains
+ready work without moving time; `AdvanceBy(delta)` / `AdvanceTo(target)`
+move virtual time and fire every timer on the way (each timer observes
+`Clock().Now()` equal to its own deadline). Introspection
+(`ReadyCount()`, `PendingTimerCount()`, `NextDeadline()`) lets tests
+assert on scheduling behaviour directly.
+
+```cpp
+auto scheduler = Coro::ManualScheduler {};
+scheduler.Post(backgroundWork(scheduler));   // detach a Task<void>
+scheduler.AdvanceBy(50ms);                   // fire timers, resume work — instantly
+```
+
+**`TracingScheduler` — you don't have to be a runtime at all.**
+([`src/Coro/TracingScheduler.hpp`](src/Coro/TracingScheduler.hpp)) is a
+*decorator*: it wraps any inner `IScheduler`, records every `Post` /
+`ScheduleAt` as a `TraceEvent`, and forwards the call unchanged. Tests
+assert on the recording (`Events()`, `Count(kind)`); demos attach a
+`Sink` callback to print the machinery live.
+
+```cpp
+auto clock  = Coro::SystemClock {};
+auto loop   = Coro::EventLoop { clock };
+auto traced = Coro::TracingScheduler { loop };   // wraps any IScheduler
+
+loop.Run(run(traced));                           // tasks talk to `traced`
+// traced.Count(Coro::TraceEvent::Kind::ScheduleAt) == number of timers armed
+```
+
+**`Win32MessageScheduler` — bolt the contract onto a loop you don't own.**
+([`src/Coro/Win32MessageScheduler.hpp`](src/Coro/Win32MessageScheduler.hpp),
+Windows only) maps `IScheduler` onto an *existing* GUI message pump:
+`Post` becomes a `WM_APP`-range message dispatched by the application's
+own `GetMessage` loop, and `ScheduleAt` parks handles in a `TimerQueue`
+behind a single `SetTimer` slot armed for the earliest deadline. A button
+handler can `Spawn` a task that `co_await`s `Sleep`/`WhenAll` chains
+while the UI stays responsive — no `WM_TIMER` state machines. Note the
+project-style fallible constructor:
+
+```cpp
+auto clock     = Coro::SystemClock {};
+auto scheduler = Coro::Win32MessageScheduler::Create(clock);  // std::expected
+if (!scheduler)
+    return report(scheduler.error());          // std::error_code from GetLastError
+
+Coro::Spawn(**scheduler, fadeInStatus(**scheduler));
+// resumes ride the message pump; the GUI thread never blocks
+```
+
+If your environment has its own loop — Qt, glib, an audio callback, a
+game engine tick — the same pattern applies: translate `Post` into "run
+this on the loop", keep deadlines in a `TimerQueue`, and arm whatever
+native timer the platform offers for `NextDeadline()`.
+
+---
+
+## Testing coroutine code
+
+Tests use Catch2 and live next to the implementation — `Foo.hpp` is
+covered by `Foo_test.cpp` in the same directory — and run via
+`ctest --preset clang-debug`. Because time and scheduling are injected
+interfaces, coroutine tests are deterministic and instant: nothing ever
+sleeps on the wall clock.
+
+The workhorse is `ManualScheduler`. A real test from
+[`src/Coro/Sleep_test.cpp`](src/Coro/Sleep_test.cpp):
+
+```cpp
+TEST_CASE("Two sequential Sleeps add their deadlines", "[Sleep]")
+{
+    auto scheduler = Coro::ManualScheduler {};
+    auto reached = 0;
+
+    auto const root = [&]() -> Coro::Task<void> {
+        co_await Coro::Sleep(scheduler, 30ms);
+        ++reached;
+        co_await Coro::Sleep(scheduler, 30ms);
+        ++reached;
+    }();
+
+    scheduler.Post(root.Native());
+    scheduler.RunUntilIdle(); // suspends at the first Sleep
+    REQUIRE(reached == 0);
+
+    scheduler.AdvanceBy(30ms); // first Sleep fires, suspends at the second
+    REQUIRE(reached == 1);
+
+    scheduler.AdvanceBy(30ms);
+    REQUIRE(reached == 2);
+    REQUIRE(root.IsReady());
 }
 ```
 
-`EventLoop::Run(Task<void> root)` posts the root coroutine and then
-iterates: drain the ready queue of resumable handles, fire any expired
-timers, sleep until the next timer, repeat — until the root task is done or
-the loop runs dry. The time source is the injected `IClock`
-(`SystemClock` in production; a `ManualClock` in tests advances time by
-hand for deterministic, instant tests).
+The pattern: create the lazy root task, post its handle
+(`scheduler.Post(root.Native())` keeps ownership in the test so
+`root.IsReady()` stays inspectable), drain with `RunUntilIdle()`, then
+step virtual time with `AdvanceBy`/`AdvanceTo` and assert after each
+step. `PendingTimerCount()` / `NextDeadline()` let you assert on the
+*scheduling* itself, not just on task side effects.
 
-Key types at a glance:
+Two more test seams when you need them:
 
-| Type | Role |
-| --- | --- |
-| `Coro::Task<T>` | Lazy, awaitable coroutine returning `T`. |
-| `Coro::IScheduler` | Interface awaitables talk to (`Post`, `Post(Task<void>&&)`, `ScheduleAt`, `Clock`). |
-| `Coro::EventLoop` | Concrete single-threaded cooperative scheduler. |
-| `Coro::IClock` / `SystemClock` | Injected time source. |
-| `Coro::Sleep` | Awaitable: suspend for a duration. |
-| `Coro::WhenAll` | Awaitable: run tasks concurrently, collect all results. |
-| `Coro::WhenAny` | Awaitable: race tasks, take the first. |
-| `Coro::Spawn` | Detach a `Task<void>` onto a scheduler. |
+- **`EventLoop` + `ManualClock`** ([`src/tests/ManualClock.hpp`](src/tests/ManualClock.hpp))
+  drives the *production* loop under fake time: interleave
+  `clock.Advance(delta)` with `loop.RunOnce()` to single-step, or call
+  `loop.Run(...)` outright — `ManualClock::WaitUntil` jumps to the next
+  deadline instead of sleeping, so even full runs finish instantly.
+- **`TracingScheduler`** wraps either of the above when the assertion is
+  about scheduler interactions ("exactly one timer was armed, at
+  t+50ms") rather than results.
 
 ---
 
@@ -380,14 +785,18 @@ idea (they're sized to fit on a lightning-talk slide):
 
 ```
 src/Coro/
-  Task.hpp        — Task<T>: the coroutine return type (start here)
-  Scheduler.hpp   — IScheduler interface
-  EventLoop.hpp   — concrete single-threaded scheduler
-  Clock.hpp       — IClock / SystemClock time seam
-  Sleep.hpp       — Sleep awaitable
-  WhenAll.hpp     — run-all-and-wait awaitable
-  WhenAny.hpp     — race-and-take-first awaitable
-  Spawn.hpp       — detach a Task<void> onto a scheduler
+  Task.hpp                        — Task<T>: the coroutine return type (start here)
+  Scheduler.hpp                   — IScheduler interface
+  Clock.hpp                       — IClock / SystemClock time seam
+  EventLoop.hpp / .cpp            — concrete single-threaded scheduler
+  TimerQueue.hpp                  — min-heap of (deadline, handle); shared by all schedulers
+  ManualScheduler.hpp / .cpp      — virtual-time scheduler for deterministic tests
+  TracingScheduler.hpp            — decorator recording every Post/ScheduleAt
+  Win32MessageScheduler.hpp / .cpp — rides a Win32 GUI message pump (Windows only)
+  Sleep.hpp                       — Sleep awaitable
+  WhenAll.hpp                     — run-all-and-wait awaitable
+  WhenAny.hpp                     — race-and-take-first awaitable
+  Spawn.hpp                       — detach a Task<void> onto a scheduler
 ```
 
 Each header is self-contained and the public surface lives in the
