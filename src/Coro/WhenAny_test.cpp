@@ -49,7 +49,7 @@ TEST_CASE("WhenAny resolves to the earliest completer", "[WhenAny]")
     auto winnerIndex = std::size_t { 0 };
     auto winnerValue = std::string {};
 
-    auto const root = [&]() -> Coro::Task<void> {
+    auto rootFn = [&]() -> Coro::Task<void> {
         auto tasks = std::vector<Coro::Task<std::string>> {};
         tasks.push_back(AfterSleep(scheduler, 100ms, "slow"));
         tasks.push_back(AfterSleep(scheduler, 25ms, "fast"));
@@ -57,7 +57,8 @@ TEST_CASE("WhenAny resolves to the earliest completer", "[WhenAny]")
         auto result = co_await Coro::WhenAny(scheduler, std::move(tasks));
         winnerIndex = result.index;
         winnerValue = std::move(result.value);
-    }();
+    };
+    auto const root = rootFn();
 
     scheduler.Post(root.Native());
     scheduler.AdvanceBy(25ms); // exactly the fastest child's deadline
@@ -80,13 +81,14 @@ TEST_CASE("WhenAny losers keep running and reclaim their frames", "[WhenAny]")
     auto loserFinished = false;
     auto winnerValue = std::string {};
 
-    auto const root = [&]() -> Coro::Task<void> {
+    auto rootFn = [&]() -> Coro::Task<void> {
         auto tasks = std::vector<Coro::Task<std::string>> {};
         tasks.push_back(SleepThenSet(scheduler, 100ms, std::move(guard), &loserFinished, "slow"));
         tasks.push_back(AfterSleep(scheduler, 25ms, "fast"));
         auto result = co_await Coro::WhenAny(scheduler, std::move(tasks));
         winnerValue = std::move(result.value);
-    }();
+    };
+    auto const root = rootFn();
 
     scheduler.Post(root.Native());
     scheduler.AdvanceBy(25ms);

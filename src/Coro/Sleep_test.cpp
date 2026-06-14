@@ -14,10 +14,11 @@ TEST_CASE("Sleep with zero duration completes immediately", "[Sleep]")
     auto scheduler = Coro::ManualScheduler {};
     auto reached = false;
 
-    auto const root = [&]() -> Coro::Task<void> {
+    auto rootFn = [&]() -> Coro::Task<void> {
         co_await Coro::Sleep(scheduler, 0ms);
         reached = true;
-    }();
+    };
+    auto const root = rootFn();
 
     scheduler.Post(root.Native());
     scheduler.RunUntilIdle();
@@ -32,12 +33,13 @@ TEST_CASE("Two sequential Sleeps add their deadlines", "[Sleep]")
     auto scheduler = Coro::ManualScheduler {};
     auto reached = 0;
 
-    auto const root = [&]() -> Coro::Task<void> {
+    auto rootFn = [&]() -> Coro::Task<void> {
         co_await Coro::Sleep(scheduler, 30ms);
         ++reached;
         co_await Coro::Sleep(scheduler, 30ms);
         ++reached;
-    }();
+    };
+    auto const root = rootFn();
 
     scheduler.Post(root.Native());
     scheduler.RunUntilIdle(); // suspends at the first Sleep

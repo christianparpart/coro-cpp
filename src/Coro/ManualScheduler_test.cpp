@@ -55,10 +55,11 @@ TEST_CASE("ManualScheduler exposes armed timers to assertions", "[ManualSchedule
     auto scheduler = Coro::ManualScheduler {};
     auto reached = false;
 
-    auto const root = [&]() -> Coro::Task<void> {
+    auto rootFn = [&]() -> Coro::Task<void> {
         co_await Coro::Sleep(scheduler, 50ms);
         reached = true;
-    }();
+    };
+    auto const root = rootFn();
 
     scheduler.Post(root.Native());
     scheduler.RunUntilIdle();
@@ -80,10 +81,11 @@ TEST_CASE("ManualScheduler does not fire timers before their deadline", "[Manual
     auto scheduler = Coro::ManualScheduler {};
     auto reached = false;
 
-    auto const root = [&]() -> Coro::Task<void> {
+    auto rootFn = [&]() -> Coro::Task<void> {
         co_await Coro::Sleep(scheduler, 100ms);
         reached = true;
-    }();
+    };
+    auto const root = rootFn();
 
     scheduler.Post(root.Native());
     scheduler.RunUntilIdle();
@@ -100,12 +102,13 @@ TEST_CASE("ManualScheduler cascades chained sleeps through a single advance", "[
     auto scheduler = Coro::ManualScheduler {};
     auto wakeTimes = std::vector<Coro::IClock::TimePoint> {};
 
-    auto const root = [&]() -> Coro::Task<void> {
+    auto rootFn = [&]() -> Coro::Task<void> {
         co_await Coro::Sleep(scheduler, 30ms);
         wakeTimes.push_back(scheduler.Now());
         co_await Coro::Sleep(scheduler, 30ms);
         wakeTimes.push_back(scheduler.Now());
-    }();
+    };
+    auto const root = rootFn();
 
     scheduler.Post(root.Native());
     scheduler.RunUntilIdle();

@@ -60,10 +60,11 @@ TEST_CASE("Win32MessageScheduler resumes a posted task via the pump", "[Win32Mes
     REQUIRE(scheduler.has_value());
 
     auto ran = false;
-    auto const root = [&]() -> Coro::Task<void> {
+    auto rootFn = [&]() -> Coro::Task<void> {
         ran = true;
         co_return;
-    }();
+    };
+    auto const root = rootFn();
 
     (*scheduler)->Post(root.Native());
     REQUIRE_FALSE(ran); // lazy until the pump dispatches the resume message
@@ -79,10 +80,11 @@ TEST_CASE("Win32MessageScheduler fires Sleep deadlines via WM_TIMER", "[Win32Mes
     REQUIRE(scheduler.has_value());
 
     auto finished = false;
-    auto const root = [&]() -> Coro::Task<void> {
+    auto rootFn = [&]() -> Coro::Task<void> {
         co_await Coro::Sleep(**scheduler, 50ms);
         finished = true;
-    }();
+    };
+    auto const root = rootFn();
 
     auto const start = clock.Now();
     (*scheduler)->Post(root.Native());
@@ -122,10 +124,11 @@ TEST_CASE("Win32MessageScheduler destruction drops queued continuations without 
 {
     auto clock = Coro::SystemClock {};
     auto ran = false;
-    auto const root = [&]() -> Coro::Task<void> {
+    auto rootFn = [&]() -> Coro::Task<void> {
         ran = true;
         co_return;
-    }();
+    };
+    auto const root = rootFn();
 
     {
         auto scheduler = Coro::Win32MessageScheduler::Create(clock);

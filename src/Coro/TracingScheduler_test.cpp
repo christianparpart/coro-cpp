@@ -18,10 +18,11 @@ TEST_CASE("TracingScheduler forwards Post to the inner scheduler and records it"
     auto tracing = Coro::TracingScheduler { inner };
     auto ran = false;
 
-    auto const root = [&]() -> Coro::Task<void> {
+    auto rootFn = [&]() -> Coro::Task<void> {
         ran = true;
         co_return;
-    }();
+    };
+    auto const root = rootFn();
 
     tracing.Post(root.Native());
 
@@ -40,10 +41,11 @@ TEST_CASE("TracingScheduler records ScheduleAt with the requested deadline", "[T
     auto tracing = Coro::TracingScheduler { inner };
     auto reached = false;
 
-    auto const root = [&]() -> Coro::Task<void> {
+    auto rootFn = [&]() -> Coro::Task<void> {
         co_await Coro::Sleep(tracing, 50ms);
         reached = true;
-    }();
+    };
+    auto const root = rootFn();
 
     tracing.Post(root.Native());
     inner.RunUntilIdle();
@@ -75,10 +77,11 @@ TEST_CASE("TracingScheduler notifies the injected sink per event, in call order"
     auto tracing = Coro::TracingScheduler { inner, [&](Coro::TraceEvent const& event) { observed.push_back(event.kind); } };
     auto reached = false;
 
-    auto const root = [&]() -> Coro::Task<void> {
+    auto rootFn = [&]() -> Coro::Task<void> {
         co_await Coro::Sleep(tracing, 10ms);
         reached = true;
-    }();
+    };
+    auto const root = rootFn();
 
     tracing.Post(root.Native());
     inner.AdvanceBy(10ms);
@@ -95,10 +98,11 @@ TEST_CASE("TracingScheduler counts per kind and supports Clear", "[TracingSchedu
     auto tracing = Coro::TracingScheduler { inner };
     auto reached = false;
 
-    auto const root = [&]() -> Coro::Task<void> {
+    auto rootFn = [&]() -> Coro::Task<void> {
         co_await Coro::Sleep(tracing, 25ms);
         reached = true;
-    }();
+    };
+    auto const root = rootFn();
 
     tracing.Post(root.Native());
     inner.AdvanceBy(25ms);
