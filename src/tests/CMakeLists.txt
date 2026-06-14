@@ -23,6 +23,15 @@ target_link_libraries(CoroTest
         Catch2::Catch2
 )
 
+# When Qt is available, link CoroQt (brings Qt6::Core include/link
+# transitively) and define CORO_HAVE_QT so the globbed QtScheduler_test.cpp
+# compiles its body. Without Qt the target does not exist, the macro is
+# undefined, and that test file is an empty translation unit.
+if(TARGET CoroQt)
+    target_link_libraries(CoroTest PRIVATE CoroQt)
+    target_compile_definitions(CoroTest PRIVATE CORO_HAVE_QT=1)
+endif()
+
 # Catch2's TEST_CASE macro expands `__COUNTER__`, which recent clang
 # considers a C2y extension. Disable -Wc2y-extensions on the test
 # binary so -Werror doesn't trip on third-party macro hygiene — our

@@ -96,6 +96,36 @@ target_include_directories(Coro PUBLIC
 )
 target_compile_features(Coro PUBLIC cxx_std_23)
 
+# ----------------------------------------------------------------------------
+# Optional Qt integration: the CoroQt library carries QtScheduler, the
+# IScheduler that rides a running Qt event loop. Gated on Qt6 being found
+# (cross-platform, unlike the Win32 scheduler) so the core Coro library and
+# the CLI demos never acquire a Qt dependency. A machine without system Qt6
+# simply skips CoroQt and the Qt/QML demo; everything else builds unchanged.
+#
+# Declared BEFORE add_subdirectory(src/Coro) so that subdirectory can register
+# QtScheduler.cpp into CoroQt next to the other schedulers (the target must
+# already exist for its `if(TARGET CoroQt)` block to fire).
+
+find_package(Qt6 6.5 QUIET COMPONENTS Core Gui Qml Quick)
+if(Qt6_FOUND)
+    message(STATUS "[Qt] Found Qt ${Qt6_VERSION} — building CoroQt + the Qt/QML demo.")
+    qt_standard_project_setup()
+    # Opt into the modern ':/qt/qml/' QML resource prefix (Qt 6.5+), which
+    # qt_add_qml_module otherwise only warns about.
+    if(POLICY QTP0001)
+        qt_policy(SET QTP0001 NEW)
+    endif()
+
+    add_library(CoroQt STATIC)
+    target_link_libraries(CoroQt PUBLIC Coro Qt6::Core)
+    set_target_properties(CoroQt PROPERTIES AUTOMOC ON)
+    # QtScheduler.cpp and its public header are registered into CoroQt from
+    # src/Coro/CMakeLists.txt, next to the other schedulers.
+else()
+    message(STATUS "[Qt] Qt6 not found — skipping CoroQt and the Qt/QML demo.")
+endif()
+
 add_subdirectory(src/Coro)
 
 # ----------------------------------------------------------------------------
