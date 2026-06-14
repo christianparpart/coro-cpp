@@ -20,6 +20,7 @@ target_sources(Coro
             Clock.hpp
             EventLoop.hpp
             ManualScheduler.hpp
+            PumpTimerDriver.hpp
             Sleep.hpp
             TimerQueue.hpp
             TracingScheduler.hpp

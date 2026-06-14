@@ -2,8 +2,8 @@
 #pragma once
 
 #include <Coro/Clock.hpp>
+#include <Coro/PumpTimerDriver.hpp>
 #include <Coro/Scheduler.hpp>
-#include <Coro/TimerQueue.hpp>
 
 #include <coroutine>
 #include <cstddef>
@@ -113,18 +113,15 @@ class Win32MessageScheduler final: public IScheduler
     /// @param threadId Win32 id of the pump thread that owns @p window.
     Win32MessageScheduler(IClock& clock, void* window, std::uint32_t threadId) noexcept;
 
-    /// `WM_TIMER` handler: posts every due timer entry back through
-    /// `Post` and re-arms for the next deadline.
-    void OnTimer();
-
-    /// Point the single `SetTimer` slot at the earliest pending
-    /// deadline, or kill it when no timers remain.
-    void RearmTimer();
-
     IClock& _clock;
     void* _window; ///< `HWND` of the hidden message-only window, stored opaquely so this header stays free of <windows.h>.
     std::uint32_t _threadId; ///< Win32 thread id of the pump thread.
-    TimerQueue _timers;
+
+    /// Shared external-pump timer algorithm. The `WM_APP` resume message,
+    /// the single `SetTimer` slot, and `KillTimer` are wired in as its
+    /// transport seams in the constructor, so this class carries no copy
+    /// of the due/drain/re-arm logic.
+    Detail::PumpTimerDriver _driver;
 };
 
 } // namespace Coro
