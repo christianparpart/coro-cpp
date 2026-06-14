@@ -765,6 +765,24 @@ ctest --preset clang-debug
 Build outputs land under `out/build/<preset>/`; demo executables under the
 runtime output dir (`target/`).
 
+### macOS
+
+The `clang-debug` / `clang-release` presets work on macOS with the same
+names. They deliberately use **Homebrew's LLVM clang**, not the Apple Clang
+that ships as `/usr/bin/clang` — Apple Clang lacks a matching `clang-tidy`
+and the static UBSan runtime these presets rely on. Install it once with:
+
+```sh
+brew install llvm
+```
+
+A toolchain file ([`cmake/HomebrewLLVM.cmake`](cmake/HomebrewLLVM.cmake),
+wired into the presets) locates the Homebrew LLVM keg automatically on both
+Apple-silicon (`/opt/homebrew`) and Intel (`/usr/local`) Macs — it does not
+need to be first on your `PATH`. If it lives somewhere unusual, point at it
+with `-DHOMEBREW_LLVM_PREFIX=<path>`. On Linux the same presets fall back to
+the plain `clang` / `clang++` on the `PATH`.
+
 ### Demos
 
 A set of single-file demos under [`src/demos`](src/demos) each illustrate one
