@@ -24,10 +24,10 @@ namespace Detail
     /// cannot be declared a friend in the header).
     struct Win32MessageSchedulerAccess
     {
-        /// Forward a `WM_TIMER` dispatch to @p self.
+        /// Forward a `WM_TIMER` dispatch to @p self's timer driver.
         static void OnTimer(Win32MessageScheduler& self)
         {
-            self.OnTimer();
+            self._driver.OnTimerExpired();
         }
     };
 } // namespace Detail
@@ -115,7 +115,24 @@ std::expected<std::unique_ptr<Win32MessageScheduler>, std::error_code> Win32Mess
 Win32MessageScheduler::Win32MessageScheduler(IClock& clock, void* window, std::uint32_t threadId) noexcept:
     _clock { clock },
     _window { window },
-    _threadId { threadId }
+    _threadId { threadId },
+    _driver {
+        clock,
+        // Resume seam: post the handle as a WM_APP message (thread-safe).
+        [this](std::coroutine_handle<> handle) { Post(handle); },
+        // Arm seam: re-use the single SetTimer slot, clamped to the Win32
+        // valid range. Re-using the same slot id replaces the previous
+        // timer, so exactly one OS timer is live regardless of how many
+        // entries are queued.
+        [this](std::chrono::milliseconds delay) {
+            auto const interval = std::clamp(static_cast<long long>(delay.count()),
+                                             static_cast<long long>(USER_TIMER_MINIMUM),
+                                             static_cast<long long>(USER_TIMER_MAXIMUM));
+            SetTimer(static_cast<HWND>(_window), TimerSlot, static_cast<UINT>(interval), nullptr);
+        },
+        // Cancel seam.
+        [this] { KillTimer(static_cast<HWND>(_window), TimerSlot); },
+    }
 {
 }
 
@@ -130,8 +147,8 @@ Win32MessageScheduler::~Win32MessageScheduler()
     // queue. The frames behind them belong to their owners (a Task or an
     // awaiter up the chain); destroying here would double-free them. This
     // mirrors EventLoop teardown, which likewise drops unfired timer
-    // handles. (Entries still in _timers are dropped the same way when
-    // the TimerQueue member is destroyed.)
+    // handles. (Entries still parked in the driver's TimerQueue are dropped
+    // the same way when the _driver member is destroyed.)
     auto pending = MSG {};
     while (PeekMessageW(&pending, window, ResumeMessage, ResumeMessage, PM_REMOVE) != 0)
     {
@@ -157,14 +174,9 @@ void Win32MessageScheduler::Post(std::coroutine_handle<> handle)
 void Win32MessageScheduler::ScheduleAt(IClock::TimePoint when, std::coroutine_handle<> handle)
 {
     assert(GetCurrentThreadId() == _threadId && "Coro::Win32MessageScheduler::ScheduleAt is pump-thread-only");
-    if (when <= _clock.Now())
-    {
-        // Already due — skip the (>=10ms granularity) timer machinery.
-        Post(handle);
-        return;
-    }
-    _timers.Schedule(when, handle);
-    RearmTimer();
+    // The shared driver owns the due/park/re-arm logic; this class only
+    // supplies the Win32 transport (see the constructor).
+    _driver.ScheduleAt(when, handle);
 }
 
 IClock const& Win32MessageScheduler::Clock() const noexcept
@@ -174,37 +186,7 @@ IClock const& Win32MessageScheduler::Clock() const noexcept
 
 std::size_t Win32MessageScheduler::PendingTimerCount() const noexcept
 {
-    return _timers.Size();
-}
-
-void Win32MessageScheduler::OnTimer()
-{
-    auto const now = _clock.Now();
-    // Route due entries back through Post instead of resuming inline:
-    // one resume path, and FIFO fairness with continuations that were
-    // posted before the timer fired.
-    while (auto const due = _timers.PopDue(now))
-        Post(due.value().handle);
-    RearmTimer();
-}
-
-void Win32MessageScheduler::RearmTimer()
-{
-    auto* const window = static_cast<HWND>(_window);
-    auto const next = _timers.NextDeadline();
-    if (!next)
-    {
-        KillTimer(window, TimerSlot);
-        return;
-    }
-    auto const now = _clock.Now();
-    auto const due = next.value() > now ? std::chrono::ceil<std::chrono::milliseconds>(next.value() - now).count()
-                                        : static_cast<long long>(0);
-    auto const interval =
-        std::clamp(due, static_cast<long long>(USER_TIMER_MINIMUM), static_cast<long long>(USER_TIMER_MAXIMUM));
-    // Re-using the same slot id replaces the previous timer, so exactly
-    // one OS timer is live regardless of how many entries are queued.
-    SetTimer(window, TimerSlot, static_cast<UINT>(interval), nullptr);
+    return _driver.PendingCount();
 }
 
 } // namespace Coro

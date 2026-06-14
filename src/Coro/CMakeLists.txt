@@ -20,6 +20,7 @@ target_sources(Coro
             Clock.hpp
             EventLoop.hpp
             ManualScheduler.hpp
+            PumpTimerDriver.hpp
             Sleep.hpp
             TimerQueue.hpp
             TracingScheduler.hpp
@@ -43,5 +44,25 @@ if(WIN32)
             BASE_DIRS "${CMAKE_SOURCE_DIR}/src"
             FILES
                 Win32MessageScheduler.hpp
+    )
+endif()
+
+# Qt event-loop scheduler: lets Qt Widgets / Qt Quick (QML) applications
+# drive Coro tasks from their existing event loop. Compiled into the
+# optional CoroQt library (created in the top-level CMakeLists when Qt6 is
+# found), so the core Coro library stays Qt-free. The sources sit here next
+# to the other schedulers; the test glob picks up QtScheduler_test.cpp.
+if(TARGET CoroQt)
+    target_sources(CoroQt
+        PRIVATE
+            QtScheduler.cpp
+    )
+    target_sources(CoroQt
+        PRIVATE
+            FILE_SET coroqt_public_headers
+            TYPE HEADERS
+            BASE_DIRS "${CMAKE_SOURCE_DIR}/src"
+            FILES
+                QtScheduler.hpp
     )
 endif()

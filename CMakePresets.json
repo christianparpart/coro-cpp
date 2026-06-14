@@ -14,18 +14,15 @@
         },
 
         {
-            "name": "clang-debug",
-            "displayName": "Clang Debug (PEDANTIC + ASan + UBSan + clang-tidy)",
+            "name": "clang-base",
+            "hidden": true,
             "inherits": "base",
             "cacheVariables": {
-                "CMAKE_BUILD_TYPE": "Debug",
                 "CMAKE_C_COMPILER": "clang",
                 "CMAKE_CXX_COMPILER": "clang++",
-                "PEDANTIC_COMPILER_WERROR": "ON",
-                "ENABLE_SANITIZER_ADDRESS": "ON",
-                "ENABLE_SANITIZER_UNDEFINED": "ON",
-                "ENABLE_TIDY": "ON"
+                "PEDANTIC_COMPILER_WERROR": "ON"
             },
+            "toolchainFile": "${sourceDir}/cmake/HomebrewLLVM.cmake",
             "condition": {
                 "type": "notEquals",
                 "lhs": "${hostSystemName}",
@@ -34,19 +31,23 @@
         },
 
         {
+            "name": "clang-debug",
+            "displayName": "Clang Debug (PEDANTIC + ASan + UBSan + clang-tidy)",
+            "inherits": "clang-base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "ENABLE_SANITIZER_ADDRESS": "ON",
+                "ENABLE_SANITIZER_UNDEFINED": "ON",
+                "ENABLE_TIDY": "ON"
+            }
+        },
+
+        {
             "name": "clang-release",
             "displayName": "Clang Release (PEDANTIC, -O3)",
-            "inherits": "base",
+            "inherits": "clang-base",
             "cacheVariables": {
-                "CMAKE_BUILD_TYPE": "Release",
-                "CMAKE_C_COMPILER": "clang",
-                "CMAKE_CXX_COMPILER": "clang++",
-                "PEDANTIC_COMPILER_WERROR": "ON"
-            },
-            "condition": {
-                "type": "notEquals",
-                "lhs": "${hostSystemName}",
-                "rhs": "Windows"
+                "CMAKE_BUILD_TYPE": "Release"
             }
         },
 
@@ -87,18 +88,11 @@
         {
             "name": "clang-asan-ubsan",
             "displayName": "Clang ASan + UBSan (no clang-tidy)",
-            "inherits": "base",
+            "inherits": "clang-base",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Debug",
-                "CMAKE_C_COMPILER": "clang",
-                "CMAKE_CXX_COMPILER": "clang++",
                 "ENABLE_SANITIZER_ADDRESS": "ON",
                 "ENABLE_SANITIZER_UNDEFINED": "ON"
-            },
-            "condition": {
-                "type": "notEquals",
-                "lhs": "${hostSystemName}",
-                "rhs": "Windows"
             }
         }
     ],

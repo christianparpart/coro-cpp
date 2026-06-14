@@ -10,19 +10,30 @@ function(GetVersionInformation VersionTripleVar VersionStringVar)
     # Check if Git is available
     find_package(Git QUIET)
 
-    if(EXISTS "${CMAKE_SOURCE_DIR}/version.txt")
-        # 1.) /version.txt file
+    # Sources are tried in priority order; the first that yields a version
+    # wins and the rest are skipped. Each block is guarded on THE_VERSION
+    # being empty so that a *present but unusable* source (e.g. a Git repo
+    # with no release tag yet) degrades to the next source instead of
+    # dead-ending — that fallthrough is the property the previous
+    # if/elseif chain lacked.
+    set(THE_VERSION "")
+    set(THE_VERSION_STRING "")
+    set(THE_SOURCE "")
+
+    # 1.) /version.txt file — the explicit, OS-independent source of truth.
+    if("${THE_VERSION}" STREQUAL "" AND EXISTS "${CMAKE_SOURCE_DIR}/version.txt")
         file(READ "${CMAKE_SOURCE_DIR}/version.txt" version_text)
         string(STRIP "${version_text}" version_text)
         string(REGEX MATCH "^v?([0-9]*\\.[0-9]+\\.[0-9]+).*$" _ ${version_text})
         set(THE_VERSION ${CMAKE_MATCH_1})
         set(THE_VERSION_STRING "${version_text}")
         set(THE_SOURCE "${CMAKE_SOURCE_DIR}/version.txt")
-    elseif(GIT_FOUND)
-        # Try to get the latest annotated tag (e.g., v1.2.34)
-        # --tags: prefers tags
-        # --abbrev=0: only show the tag name, not the commit hash
-        # --match "v*": only consider tags starting with 'v'
+    endif()
+
+    # 2.) Latest annotated release tag (e.g., v1.2.34).
+    if("${THE_VERSION}" STREQUAL "" AND GIT_FOUND)
+        # --tags: prefers tags; --abbrev=0: only the tag name, no commit hash;
+        # --match "v*": only consider tags starting with 'v'.
         execute_process(
             COMMAND ${GIT_EXECUTABLE} describe --tags --abbrev=0 --match "v*"
             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
@@ -32,35 +43,20 @@ function(GetVersionInformation VersionTripleVar VersionStringVar)
             RESULT_VARIABLE GIT_RESULT
         )
         if (GIT_RESULT EQUAL 0 AND NOT "${GIT_TAG}" STREQUAL "")
-            # Remove the 'v' prefix if it exists
+            # Remove the 'v' prefix if it exists.
             string(REGEX REPLACE "^v" "" VERSION_FROM_GIT "${GIT_TAG}")
             message(STATUS "Successfully retrieved version '${VERSION_FROM_GIT}' from Git tag.")
             set(THE_VERSION "${VERSION_FROM_GIT}")
             set(THE_VERSION_STRING "${VERSION_FROM_GIT}")
-            set(THE_SOURCE "git")
+            set(THE_SOURCE "git tag")
         else()
             message(STATUS "Info: No suitable Git tag (e.g., 'v1.2.34') found.")
         endif()
-    elseif(EXISTS "${CMAKE_SOURCE_DIR}/.git")
-        # 2.) .git directory with the output of `git describe ...`)
-        execute_process(COMMAND git describe --all
-            OUTPUT_VARIABLE git_branch
-            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-            OUTPUT_STRIP_TRAILING_WHITESPACE)
-        string(REGEX MATCH "^(.*)\\/(.*)$$" _ "${git_branch}")
-        set(THE_GIT_BRANCH "${CMAKE_MATCH_2}")
-        message(STATUS "[Version] Git branch: ${THE_GIT_BRANCH}")
+    endif()
 
-        execute_process(COMMAND git rev-parse --short HEAD
-            OUTPUT_VARIABLE git_sha_short
-            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-            OUTPUT_STRIP_TRAILING_WHITESPACE)
-        set(THE_GIT_SHA_SHORT "${git_sha_short}")
-        message(STATUS "[Version] Git SHA: ${THE_GIT_SHA_SHORT}")
-    elseif(EXISTS "${CMAKE_SOURCE_DIR}/metainfo.xml")
-        # 3.) /metainfo.xml with the first line's version number and optional (suffix) string
+    # 3.) /metainfo.xml — first <release> entry's version, optional CI run-ID.
+    if("${THE_VERSION}" STREQUAL "" AND EXISTS "${CMAKE_SOURCE_DIR}/metainfo.xml")
         file(READ "${CMAKE_SOURCE_DIR}/metainfo.xml" changelog_contents)
-        # extract and construct version triple
         string(REGEX MATCH "<release version=\"([0-9]*\\.[0-9]+\\.[0-9]+)\".*$" _ "${changelog_contents}")
         set(THE_VERSION ${CMAKE_MATCH_1})
 
@@ -71,6 +67,23 @@ function(GetVersionInformation VersionTripleVar VersionStringVar)
 
         set(THE_VERSION_STRING "${THE_VERSION}")
         set(THE_SOURCE "${CMAKE_SOURCE_DIR}/metainfo.xml")
+    endif()
+
+    # 4.) Untagged Git checkout — derive a 0.0.0 dev version from branch + SHA
+    #     so a fresh clone with no tag still configures. This is the final
+    #     fallback before giving up.
+    if("${THE_VERSION}" STREQUAL "" AND GIT_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
+        execute_process(COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
+            OUTPUT_VARIABLE git_sha_short
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET)
+        if(NOT "${git_sha_short}" STREQUAL "")
+            set(THE_VERSION "0.0.0")
+            set(THE_VERSION_STRING "0.0.0-dev+g${git_sha_short}")
+            set(THE_SOURCE "git revision (untagged)")
+            message(STATUS "[Version] No version.txt/tag/metainfo.xml; using untagged dev version ${THE_VERSION_STRING}.")
+        endif()
     endif()
 
     if("${THE_VERSION}" STREQUAL "" OR "${THE_VERSION_STRING}" STREQUAL "")

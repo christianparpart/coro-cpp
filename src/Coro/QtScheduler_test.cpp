@@ -1,62 +1,62 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Tests for the Win32 message-pump scheduler. The whole file is guarded:
-// the test binary globs every *_test.cpp, and on non-Windows hosts this
-// must compile to an empty translation unit (the scheduler itself is
-// only built under if(WIN32)).
-#ifdef _WIN32
+// Tests for the Qt event-loop scheduler. The whole file is guarded: the
+// test binary globs every *_test.cpp, and where Qt is unavailable (the
+// CORO_HAVE_QT macro is only defined when the build links CoroQt) this must
+// compile to an empty translation unit — mirroring Win32MessageScheduler_test.
+#if defined(CORO_HAVE_QT)
 
+    #include <Coro/QtScheduler.hpp>
     #include <Coro/Sleep.hpp>
     #include <Coro/Task.hpp>
-    #include <Coro/Win32MessageScheduler.hpp>
 
     #include <catch2/catch_test_macros.hpp>
 
-    #ifndef WIN32_LEAN_AND_MEAN
-        #define WIN32_LEAN_AND_MEAN
-    #endif
-    #ifndef NOMINMAX
-        #define NOMINMAX
-    #endif
     #include <chrono>
     #include <vector>
 
-    #include <windows.h>
+    #include <QtCore/QCoreApplication>
+    #include <QtCore/QEventLoop>
 
 using namespace std::chrono_literals;
 
 namespace
 {
 
-/// Pump the calling thread's message queue until @p done turns true or
-/// @p budget of wall time elapses — a miniature stand-in for the message
-/// loop an MFC application would already be running.
+/// Lazily-constructed `QCoreApplication`, shared by every case. Qt forbids
+/// more than one instance per process, so it is created once and kept
+/// alive for the whole test run. `argv` storage must outlive it.
+/// @return The process-wide application instance.
+QCoreApplication& App()
+{
+    static int argc = 1;
+    static char arg0[] = "CoroTest";
+    static char* argv[] = { static_cast<char*>(arg0), nullptr };
+    static auto app = QCoreApplication { argc, static_cast<char**>(argv) };
+    return app;
+}
+
+/// Pump the Qt event loop until @p done turns true or @p budget of wall
+/// time elapses — a miniature stand-in for the `exec()` loop a real Qt
+/// application would already be running.
 /// @param done Flag the coroutine under test sets on completion.
 /// @param budget Wall-clock cap so a regression cannot hang the suite.
 /// @return The final value of @p done.
 bool PumpUntil(bool const& done, std::chrono::milliseconds budget)
 {
     auto const deadline = std::chrono::steady_clock::now() + budget;
-    auto message = MSG {};
     while (!done && std::chrono::steady_clock::now() < deadline)
-    {
-        while (!done && PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE) != 0)
-        {
-            TranslateMessage(&message);
-            DispatchMessageW(&message);
-        }
-        if (!done)
-            MsgWaitForMultipleObjects(0, nullptr, FALSE, 10, QS_ALLINPUT);
-    }
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
     return done;
 }
 
 } // namespace
 
-TEST_CASE("Win32MessageScheduler resumes a posted task via the pump", "[Win32MessageScheduler]")
+TEST_CASE("QtScheduler resumes a posted task via the event loop", "[QtScheduler]")
 {
+    App();
     auto clock = Coro::SystemClock {};
-    auto scheduler = Coro::Win32MessageScheduler::Create(clock);
+    auto scheduler = Coro::QtScheduler::Create(clock);
     REQUIRE(scheduler.has_value());
 
     auto ran = false;
@@ -67,16 +67,17 @@ TEST_CASE("Win32MessageScheduler resumes a posted task via the pump", "[Win32Mes
     auto const root = rootFn();
 
     (*scheduler)->Post(root.Native());
-    REQUIRE_FALSE(ran); // lazy until the pump dispatches the resume message
+    REQUIRE_FALSE(ran); // lazy until the event loop dispatches the resume functor
 
     REQUIRE(PumpUntil(ran, 2000ms));
     REQUIRE(root.IsReady());
 }
 
-TEST_CASE("Win32MessageScheduler fires Sleep deadlines via WM_TIMER", "[Win32MessageScheduler]")
+TEST_CASE("QtScheduler fires Sleep deadlines via QTimer", "[QtScheduler]")
 {
+    App();
     auto clock = Coro::SystemClock {};
-    auto scheduler = Coro::Win32MessageScheduler::Create(clock);
+    auto scheduler = Coro::QtScheduler::Create(clock);
     REQUIRE(scheduler.has_value());
 
     auto finished = false;
@@ -91,13 +92,14 @@ TEST_CASE("Win32MessageScheduler fires Sleep deadlines via WM_TIMER", "[Win32Mes
 
     REQUIRE(PumpUntil(finished, 5000ms));
     REQUIRE(clock.Now() - start >= 50ms);            // never early
-    REQUIRE((*scheduler)->PendingTimerCount() == 0); // timer slot drained
+    REQUIRE((*scheduler)->PendingTimerCount() == 0); // timer drained
 }
 
-TEST_CASE("Win32MessageScheduler resumes posted handles in FIFO order", "[Win32MessageScheduler]")
+TEST_CASE("QtScheduler resumes posted handles in FIFO order", "[QtScheduler]")
 {
+    App();
     auto clock = Coro::SystemClock {};
-    auto scheduler = Coro::Win32MessageScheduler::Create(clock);
+    auto scheduler = Coro::QtScheduler::Create(clock);
     REQUIRE(scheduler.has_value());
 
     auto order = std::vector<int> {};
@@ -120,8 +122,9 @@ TEST_CASE("Win32MessageScheduler resumes posted handles in FIFO order", "[Win32M
     REQUIRE(order == std::vector<int> { 1, 2, 3 });
 }
 
-TEST_CASE("Win32MessageScheduler destruction drops queued continuations without resuming them", "[Win32MessageScheduler]")
+TEST_CASE("QtScheduler destruction drops queued continuations without resuming them", "[QtScheduler]")
 {
+    App();
     auto clock = Coro::SystemClock {};
     auto ran = false;
     auto rootFn = [&]() -> Coro::Task<void> {
@@ -131,11 +134,11 @@ TEST_CASE("Win32MessageScheduler destruction drops queued continuations without 
     auto const root = rootFn();
 
     {
-        auto scheduler = Coro::Win32MessageScheduler::Create(clock);
+        auto scheduler = Coro::QtScheduler::Create(clock);
         REQUIRE(scheduler.has_value());
         (*scheduler)->Post(root.Native());
-        // Destroyed without ever pumping: the queued resume message must
-        // be drained, not dispatched into a dead scheduler later.
+        // Destroyed without ever pumping: the queued resume functor must be
+        // dropped, not dispatched into a dead scheduler later.
     }
 
     REQUIRE_FALSE(ran); // never resumed
@@ -143,4 +146,4 @@ TEST_CASE("Win32MessageScheduler destruction drops queued continuations without 
     // `root` going out of scope reclaims the untouched frame.
 }
 
-#endif // _WIN32
+#endif // CORO_HAVE_QT

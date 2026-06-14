@@ -43,9 +43,10 @@ TEST_CASE("WhenAll collects results from ready tasks", "[WhenAll]")
     auto scheduler = Coro::ManualScheduler {};
     auto got = std::tuple<int, int, int> {};
 
-    auto const root = [&]() -> Coro::Task<void> {
+    auto rootFn = [&]() -> Coro::Task<void> {
         got = co_await Coro::WhenAll(scheduler, Yield(1), Yield(2), Yield(3));
-    }();
+    };
+    auto const root = rootFn();
 
     scheduler.Post(root.Native());
     scheduler.RunUntilIdle(); // no timers involved — one drain settles everything
@@ -62,13 +63,14 @@ TEST_CASE("WhenAll runs sleepers concurrently — slowest dominates", "[WhenAll]
     auto got = std::tuple<std::string, std::string, std::string> {};
     auto finished = false;
 
-    auto const root = [&]() -> Coro::Task<void> {
+    auto rootFn = [&]() -> Coro::Task<void> {
         got = co_await Coro::WhenAll(scheduler,
                                      AfterSleep(scheduler, 100ms, "a"),
                                      AfterSleep(scheduler, 50ms, "b"),
                                      AfterSleep(scheduler, 75ms, "c"));
         finished = true;
-    }();
+    };
+    auto const root = rootFn();
 
     scheduler.Post(root.Native());
     scheduler.RunUntilIdle(); // all three children park on their timers
@@ -99,10 +101,11 @@ TEST_CASE("WhenAll folds void children out of the result tuple", "[WhenAll]")
     // resolve to tuple<int, string>, as documented.
     auto got = std::tuple<int, std::string> {};
 
-    auto const root = [&]() -> Coro::Task<void> {
+    auto rootFn = [&]() -> Coro::Task<void> {
         got = co_await Coro::WhenAll(
             scheduler, Yield(1), VoidAfterSleep(scheduler, 50ms, &voidDone), AfterSleep(scheduler, 25ms, "folded"));
-    }();
+    };
+    auto const root = rootFn();
 
     scheduler.Post(root.Native());
     scheduler.AdvanceBy(50ms); // crosses both sleeps in one advance

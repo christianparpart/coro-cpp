@@ -9,8 +9,8 @@ coroutine handles) into a handful of building blocks you can actually use:
   or your own).
 - **`IScheduler` / `EventLoop`** — the cooperative runtime that drives
   suspended coroutines to completion, with drop-in alternatives: a
-  virtual-time scheduler for tests, a tracing decorator, and a Win32
-  message-pump adapter.
+  virtual-time scheduler for tests, a tracing decorator, and adapters that
+  ride a host GUI loop (a Win32 message pump or the Qt event loop).
 - **`Spawn`** — fire-and-forget a background coroutine.
 
 The goal is that asynchronous code reads like ordinary, straight-line code
@@ -455,12 +455,15 @@ the loop runs dry. The time source is the injected `IClock`
 (`SystemClock` in production; a `ManualClock` in tests advances time by
 hand for deterministic, instant tests).
 
-`EventLoop` is only the default `IScheduler`. The library ships three
+`EventLoop` is only the default `IScheduler`. The library ships four
 more — `ManualScheduler` (virtual time for tests), `TracingScheduler` (a
-decorator that records every scheduling call), and
-`Win32MessageScheduler` (rides a GUI message pump) — covered in
+decorator that records every scheduling call), `Win32MessageScheduler`
+(rides a Win32 GUI message pump), and `QtScheduler` (rides the Qt event
+loop) — covered in
 [Extending Coro](#extending-coro) and
-[Testing coroutine code](#testing-coroutine-code).
+[Testing coroutine code](#testing-coroutine-code). The two GUI adapters
+share one implementation of the "external-pump" timer algorithm via the
+internal `Detail::PumpTimerDriver`.
 
 Key types at a glance:
 
@@ -472,6 +475,7 @@ Key types at a glance:
 | `Coro::ManualScheduler` | Virtual-time scheduler for deterministic tests (`RunUntilIdle`, `AdvanceBy`, `AdvanceTo`). |
 | `Coro::TracingScheduler` | Decorator that records every `Post`/`ScheduleAt` on the wrapped scheduler. |
 | `Coro::Win32MessageScheduler` | Scheduler riding an existing Win32 GUI message pump (Windows only). |
+| `Coro::QtScheduler` | Scheduler riding a running Qt event loop (Qt Widgets / Qt Quick / QML). |
 | `Coro::TimerQueue` | Min-heap of (deadline, handle) entries — the timer engine the schedulers compose. |
 | `Coro::IClock` / `SystemClock` | Injected time source. |
 | `Coro::Sleep` | Awaitable: suspend for a duration. |
@@ -682,10 +686,35 @@ Coro::Spawn(**scheduler, fadeInStatus(**scheduler));
 // resumes ride the message pump; the GUI thread never blocks
 ```
 
-If your environment has its own loop — Qt, glib, an audio callback, a
-game engine tick — the same pattern applies: translate `Post` into "run
-this on the loop", keep deadlines in a `TimerQueue`, and arm whatever
-native timer the platform offers for `NextDeadline()`.
+**`QtScheduler` — the same idea for Qt.**
+([`src/Coro/QtScheduler.hpp`](src/Coro/QtScheduler.hpp), built whenever Qt6
+is found) rides a running Qt event loop: `Post` becomes a queued
+`QMetaObject::invokeMethod` resumed by the loop on the GUI thread, and
+`ScheduleAt` arms a single re-used `QTimer` for the earliest deadline. A
+QML button handler can `Spawn` a task that `co_await`s a chain of async
+steps while the `BusyIndicator` keeps spinning — see the
+[`qt_coro_demo`](src/demos/qt_coro_demo) Qt Quick app, whose backend runs
+three sequential simulated fetches as straight-line `co_await` code and
+cancels them mid-flight with a `std::stop_token`. Same fallible
+constructor:
+
+```cpp
+auto clock     = Coro::SystemClock {};
+auto scheduler = Coro::QtScheduler::Create(clock);   // std::expected; needs a QCoreApplication
+if (!scheduler)
+    return report(scheduler.error());
+
+Coro::Spawn(**scheduler, loadProfile(**scheduler));
+// resumes ride the Qt event loop; the GUI thread never blocks
+```
+
+`Win32MessageScheduler` and `QtScheduler` are deliberately thin: both
+delegate the due/park/re-arm timer logic to the internal
+`Detail::PumpTimerDriver`, supplying only their three transport seams
+(resume-on-loop, arm-timer, cancel-timer). If your environment has yet
+another loop — glib, an audio callback, a game engine tick — the same
+pattern applies: implement those three seams over `PumpTimerDriver` and
+the algorithm comes for free.
 
 ---
 
@@ -765,6 +794,24 @@ ctest --preset clang-debug
 Build outputs land under `out/build/<preset>/`; demo executables under the
 runtime output dir (`target/`).
 
+### macOS
+
+The `clang-debug` / `clang-release` presets work on macOS with the same
+names. They deliberately use **Homebrew's LLVM clang**, not the Apple Clang
+that ships as `/usr/bin/clang` — Apple Clang lacks a matching `clang-tidy`
+and the static UBSan runtime these presets rely on. Install it once with:
+
+```sh
+brew install llvm
+```
+
+A toolchain file ([`cmake/HomebrewLLVM.cmake`](cmake/HomebrewLLVM.cmake),
+wired into the presets) locates the Homebrew LLVM keg automatically on both
+Apple-silicon (`/opt/homebrew`) and Intel (`/usr/local`) Macs — it does not
+need to be first on your `PATH`. If it lives somewhere unusual, point at it
+with `-DHOMEBREW_LLVM_PREFIX=<path>`. On Linux the same presets fall back to
+the plain `clang` / `clang++` on the `PATH`.
+
 ### Demos
 
 A set of single-file demos under [`src/demos`](src/demos) each illustrate one
@@ -779,6 +826,17 @@ idea (they're sized to fit on a lightning-talk slide):
 | `demo_spinner_cancel` | `Spawn` a background spinner, cancel via `std::stop_token`. |
 | `demo_dashboard` | Several animated regions multiplexed on one thread. |
 
+When Qt6 is available, one more — a **pure Qt/QML** app —
+is built: [`qt_coro_demo`](src/demos/qt_coro_demo). A QML button kicks off
+three sequential simulated fetches written as straight-line `co_await`
+code in a `QObject` backend (`FetchBackend`) running on the Qt event loop
+via `QtScheduler`. A progress bar and status label track each step while a
+`BusyIndicator` keeps spinning — visible proof the GUI thread never blocks
+— and a **Cancel** button aborts the sequence mid-flight through a
+`std::stop_token`. It is the "after callbacks" picture for a real GUI: the
+same flow with nested `QFutureWatcher`/signal-slot handlers would be a
+callback pyramid that is awkward to cancel partway through.
+
 ---
 
 ## Library layout
@@ -792,7 +850,9 @@ src/Coro/
   TimerQueue.hpp                  — min-heap of (deadline, handle); shared by all schedulers
   ManualScheduler.hpp / .cpp      — virtual-time scheduler for deterministic tests
   TracingScheduler.hpp            — decorator recording every Post/ScheduleAt
+  PumpTimerDriver.hpp             — shared external-pump timer algorithm (Win32 + Qt share it)
   Win32MessageScheduler.hpp / .cpp — rides a Win32 GUI message pump (Windows only)
+  QtScheduler.hpp / .cpp          — rides a Qt event loop (built when Qt6 is found)
   Sleep.hpp                       — Sleep awaitable
   WhenAll.hpp                     — run-all-and-wait awaitable
   WhenAny.hpp                     — race-and-take-first awaitable
